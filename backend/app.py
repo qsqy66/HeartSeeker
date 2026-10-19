@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 import fitz
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from .embedding import (
     DEFAULT_EMBED_MODEL,
@@ -36,6 +37,7 @@ MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_PAGES = 300
 PROVIDERS = {"deepseek": "https://api.deepseek.com/chat/completions", "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"}
 MODEL_ENDPOINTS = {"deepseek": "https://api.deepseek.com/models", "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1/models"}
+RECENT_TURNS = 10  # 最近 10 轮对话原文保留，更早的历史压缩为摘要
 
 # --- Structured extraction heuristics -------------------------------------------------
 
@@ -139,6 +141,25 @@ def initialize_storage() -> None:
             CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
                 INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.id, old.text);
             END;
+            CREATE TABLE IF NOT EXISTS chat_summaries (
+                paper_id INTEGER PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
+                summary TEXT NOT NULL,
+                summarized_upto INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS general_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                provider TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS general_summary (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                summary TEXT NOT NULL,
+                summarized_upto INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         # Migrate databases created by earlier V1 versions without making startup fragile.
@@ -439,6 +460,8 @@ class ChatPayload(BaseModel):
     message: str = Field(default="", max_length=12000)
     question: str = Field(default="", max_length=12000)
     provider: Optional[str] = None
+    stream: bool = False
+    retry: bool = False
 
 
 class ModelsPayload(BaseModel):
@@ -500,6 +523,191 @@ def _provider_chat(provider: str, key: str, prompt: str, model: str) -> str:
         return data["choices"][0]["message"]["content"]
     except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError) as error:
         raise HTTPException(502, f"{provider} 服务暂不可用") from error
+
+
+def _stream_provider_chat(provider: str, key: str, prompt: str, model: str):
+    """Yield text deltas from an OpenAI-compatible streaming chat completion."""
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "stream": True,
+    }).encode()
+    request = urllib.request.Request(PROVIDERS[provider], data=payload, headers={
+        "Authorization": f"Bearer {key}", "Content-Type": "application/json"
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                piece = (choices[0].get("delta") or {}).get("content")
+                if piece:
+                    yield piece
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        raise HTTPException(502, f"{provider} 服务暂不可用") from error
+
+
+def _default_provider() -> str:
+    with get_connection() as connection:
+        row = connection.execute("SELECT value FROM settings WHERE key='provider'").fetchone()
+    provider = (row["value"].strip() if row and row["value"].strip() else "deepseek")
+    return provider if provider in PROVIDERS else "deepseek"
+
+
+def _resolve_model(provider: str) -> str:
+    with get_connection() as connection:
+        setting = connection.execute("SELECT value FROM settings WHERE key='model'").fetchone()
+    return setting["value"].strip() if setting and setting["value"].strip() else (
+        "deepseek-chat" if provider == "deepseek" else "qwen-plus"
+    )
+
+
+def _format_turns(messages: list[dict[str, Any]]) -> str:
+    return "\n".join(f"{'用户' if m['role'] == 'user' else '助手'}: {m['content']}" for m in messages)
+
+
+def _split_history(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if len(messages) <= RECENT_TURNS * 2:
+        return [], messages
+    return messages[:-RECENT_TURNS * 2], messages[-RECENT_TURNS * 2:]
+
+
+def _summarize_history(provider: str, key: str, model: str, existing_summary: str, uncovered: list[dict[str, Any]]) -> str:
+    base = (existing_summary + "\n\n" if existing_summary else "") + _format_turns(uncovered)
+    prompt = ("将以下对话历史压缩成简洁摘要（不超过300字），保留关键事实、用户关注点、"
+              "重要结论和指代关系，供后续追问参考。只输出摘要正文。\n\n对话历史：\n" + base)
+    try:
+        return _provider_chat(provider, key, prompt, model).strip()
+    except Exception:
+        return existing_summary or ""
+
+
+def _paper_conversation_state(paper_id: int, provider: str, key: str, model: str) -> tuple[str, list[dict[str, Any]]]:
+    with get_connection() as connection:
+        messages = [dict(row) for row in connection.execute(
+            "SELECT id, role, content FROM chat_messages WHERE paper_id=? ORDER BY id", (paper_id,)
+        ).fetchall()]
+        row = connection.execute("SELECT summary, summarized_upto FROM chat_summaries WHERE paper_id=?", (paper_id,)).fetchone()
+    older, recent = _split_history(messages)
+    if not older:
+        return "", recent
+    last_older_id = older[-1]["id"]
+    summary = row["summary"] if row else ""
+    covered = row["summarized_upto"] if row else 0
+    if covered >= last_older_id:
+        return summary, recent
+    uncovered = [m for m in older if m["id"] > covered]
+    summary = _summarize_history(provider, key, model, summary, uncovered)
+    with get_connection() as connection:
+        connection.execute(
+            "INSERT INTO chat_summaries(paper_id, summary, summarized_upto, updated_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(paper_id) DO UPDATE SET summary=excluded.summary, summarized_upto=excluded.summarized_upto, updated_at=excluded.updated_at",
+            (paper_id, summary, last_older_id, utc_now()),
+        )
+    return summary, recent
+
+
+def _general_conversation_state(provider: str, key: str, model: str) -> tuple[str, list[dict[str, Any]]]:
+    with get_connection() as connection:
+        messages = [dict(row) for row in connection.execute(
+            "SELECT id, role, content FROM general_messages ORDER BY id"
+        ).fetchall()]
+        row = connection.execute("SELECT summary, summarized_upto FROM general_summary WHERE id=1").fetchone()
+    older, recent = _split_history(messages)
+    if not older:
+        return "", recent
+    last_older_id = older[-1]["id"]
+    summary = row["summary"] if row else ""
+    covered = row["summarized_upto"] if row else 0
+    if covered >= last_older_id:
+        return summary, recent
+    uncovered = [m for m in older if m["id"] > covered]
+    summary = _summarize_history(provider, key, model, summary, uncovered)
+    with get_connection() as connection:
+        connection.execute(
+            "INSERT INTO general_summary(id, summary, summarized_upto, updated_at) VALUES(1,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET summary=excluded.summary, summarized_upto=excluded.summarized_upto, updated_at=excluded.updated_at",
+            (summary, last_older_id, utc_now()),
+        )
+    return summary, recent
+
+
+def _build_paper_prompt(summary: str, recent: list[dict[str, Any]], context: str, message: str) -> str:
+    parts = ["你是医学论文精读助手。用户正在针对同一篇论文连续提问，请结合对话历史理解用户问题中的指代和上下文。仅依据下面给出的论文内容回答；必须在回答中引用一个或多个 [Page N] 页码；不确定时明确说无法从论文判断。"]
+    if summary:
+        parts.append("【历史对话摘要】\n" + summary)
+    if recent:
+        parts.append("【最近对话】\n" + _format_turns(recent))
+    parts.append("【论文内容】\n" + context)
+    parts.append("【当前问题】\n" + message)
+    return "\n\n".join(parts)
+
+
+def _build_general_prompt(summary: str, recent: list[dict[str, Any]], message: str) -> str:
+    parts = ["你是面向医学生的临床医学学习助手，用清晰、准确、易懂的语言回答；涉及医学事实时尽量严谨，不确定时如实说明。请结合对话历史理解用户的追问和指代。"]
+    if summary:
+        parts.append("【历史对话摘要】\n" + summary)
+    if recent:
+        parts.append("【最近对话】\n" + _format_turns(recent))
+    parts.append("【当前问题】\n" + message)
+    return "\n\n".join(parts)
+
+
+def _paper_chat_stream(paper_id: int, provider: str, key: str, model: str, prompt: str,
+                       message: str, grounding: str, retrieved: list[dict[str, Any]]):
+    parts: list[str] = []
+    try:
+        for delta in _stream_provider_chat(provider, key, prompt, model):
+            parts.append(delta)
+            yield json.dumps({"delta": delta}, ensure_ascii=False) + "\n"
+    except HTTPException as error:
+        yield json.dumps({"error": error.detail}, ensure_ascii=False) + "\n"
+        return
+    raw = "".join(parts).strip()
+    try:
+        answer = _grounded_response(message, raw, grounding)
+    except HTTPException as error:
+        yield json.dumps({"error": error.detail}, ensure_ascii=False) + "\n"
+        return
+    with get_connection() as connection:
+        cursor = connection.execute("INSERT INTO chat_messages(paper_id,role,content,provider,created_at) VALUES(?,?,?,?,?)",
+                                     (paper_id, "assistant", answer, provider, utc_now()))
+    citations = []
+    for page_number in sorted({int(number) for number in re.findall(r"\[Page\s+(\d+)\]", answer)}):
+        citations.append({"id": page_number, "page_number": page_number, "text": f"[Page {page_number}]"})
+    yield json.dumps({"done": True, "id": cursor.lastrowid, "content": answer,
+                      "citations": citations, "sources": _clean_chunks(retrieved)}, ensure_ascii=False) + "\n"
+
+
+def _general_chat_stream(provider: str, key: str, model: str, prompt: str):
+    parts: list[str] = []
+    try:
+        for delta in _stream_provider_chat(provider, key, prompt, model):
+            parts.append(delta)
+            yield json.dumps({"delta": delta}, ensure_ascii=False) + "\n"
+    except HTTPException as error:
+        yield json.dumps({"error": error.detail}, ensure_ascii=False) + "\n"
+        return
+    answer = "".join(parts).strip()
+    if not answer:
+        yield json.dumps({"error": "模型返回了空响应"}, ensure_ascii=False) + "\n"
+        return
+    with get_connection() as connection:
+        cursor = connection.execute("INSERT INTO general_messages(role,content,provider,created_at) VALUES(?,?,?,?)",
+                                     ("assistant", answer, provider, utc_now()))
+    yield json.dumps({"done": True, "id": cursor.lastrowid, "content": answer}, ensure_ascii=False) + "\n"
 
 
 app = FastAPI(title="Paper Reader Local API", version="0.2.0")
@@ -832,26 +1040,32 @@ def chat(paper_id: int, payload: ChatPayload) -> dict[str, Any]:
     message = (payload.message or payload.question).strip()
     if not message:
         raise HTTPException(400, "问题不能为空")
-    provider = (payload.provider or "deepseek").lower()
+    provider = (payload.provider or _default_provider()).lower()
     if provider not in PROVIDERS:
         raise HTTPException(400, "provider 必须是 deepseek 或 qwen")
     key = _key_store(provider)
     if not key:
         raise HTTPException(400, f"{provider} 尚未配置 API key")
+    model = _resolve_model(provider)
     context, retrieved = _rag_context(paper_id, message)
-    with get_connection() as connection:
-        setting = connection.execute("SELECT value FROM settings WHERE key='model'").fetchone()
-    model = setting["value"].strip() if setting and setting["value"].strip() else (
-        "deepseek-chat" if provider == "deepseek" else "qwen-plus"
-    )
-    prompt = (
-        "仅依据以下论文内容回答问题。必须在回答中引用一个或多个 [Page N] 页码；"
-        "不确定时明确说无法从论文判断。\n论文内容:\n" + context + "\n问题:\n" + message
-    )
-    with get_connection() as connection:
-        connection.execute("INSERT INTO chat_messages(paper_id,role,content,provider,created_at) VALUES(?,?,?,?,?)",
-                           (paper_id, "user", message, provider, utc_now()))
-    answer = _grounded_response(message, _provider_chat(provider, key, prompt, model), context)
+    summary, recent = _paper_conversation_state(paper_id, provider, key, model)
+    if payload.retry:
+        # 重试：当前问题已在上次落库，避免在 prompt 里重复出现
+        if recent and recent[-1]["role"] == "user":
+            recent = recent[:-1]
+    else:
+        with get_connection() as connection:
+            connection.execute("INSERT INTO chat_messages(paper_id,role,content,provider,created_at) VALUES(?,?,?,?,?)",
+                               (paper_id, "user", message, provider, utc_now()))
+    prompt = _build_paper_prompt(summary, recent, context, message)
+    grounding = context + "\n" + _format_turns(recent) + ("\n" + summary if summary else "")
+    if payload.stream:
+        return StreamingResponse(
+            _paper_chat_stream(paper_id, provider, key, model, prompt, message, grounding, retrieved),
+            media_type="application/x-ndjson",
+        )
+    raw = _provider_chat(provider, key, prompt, model)
+    answer = _grounded_response(message, raw, grounding)
     with get_connection() as connection:
         cursor = connection.execute("INSERT INTO chat_messages(paper_id,role,content,provider,created_at) VALUES(?,?,?,?,?)",
                                      (paper_id, "assistant", answer, provider, utc_now()))
@@ -869,6 +1083,51 @@ def chat_history(paper_id: int) -> list[dict[str, Any]]:
     with get_connection() as connection:
         rows = connection.execute(
             "SELECT id,role,content,provider,created_at FROM chat_messages WHERE paper_id=? ORDER BY id", (paper_id,)
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.post("/api/chat")
+def general_chat(payload: ChatPayload) -> dict[str, Any]:
+    message = (payload.message or payload.question).strip()
+    if not message:
+        raise HTTPException(400, "问题不能为空")
+    provider = (payload.provider or _default_provider()).lower()
+    if provider not in PROVIDERS:
+        raise HTTPException(400, "provider 必须是 deepseek 或 qwen")
+    key = _key_store(provider)
+    if not key:
+        raise HTTPException(400, f"{provider} 尚未配置 API key")
+    model = _resolve_model(provider)
+    summary, recent = _general_conversation_state(provider, key, model)
+    if payload.retry:
+        # 重试：当前问题已在上次落库，避免在 prompt 里重复出现
+        if recent and recent[-1]["role"] == "user":
+            recent = recent[:-1]
+    else:
+        with get_connection() as connection:
+            connection.execute("INSERT INTO general_messages(role,content,provider,created_at) VALUES(?,?,?,?)",
+                               ("user", message, provider, utc_now()))
+    prompt = _build_general_prompt(summary, recent, message)
+    if payload.stream:
+        return StreamingResponse(
+            _general_chat_stream(provider, key, model, prompt),
+            media_type="application/x-ndjson",
+        )
+    answer = _provider_chat(provider, key, prompt, model).strip()
+    if not answer:
+        raise HTTPException(502, "模型返回了空响应")
+    with get_connection() as connection:
+        cursor = connection.execute("INSERT INTO general_messages(role,content,provider,created_at) VALUES(?,?,?,?)",
+                                     ("assistant", answer, provider, utc_now()))
+    return {"id": cursor.lastrowid, "content": answer, "answer": answer, "provider": provider}
+
+
+@app.get("/api/chat")
+def general_chat_history() -> list[dict[str, Any]]:
+    with get_connection() as connection:
+        rows = connection.execute(
+            "SELECT id,role,content,provider,created_at FROM general_messages ORDER BY id"
         ).fetchall()
     return [dict(row) for row in rows]
 

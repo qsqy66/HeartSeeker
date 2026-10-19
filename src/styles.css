@@ -10,3 +10,8 @@
 .pdf-loading,.pdf-error{padding:40px;text-align:center;color:#71827b}
 .source-chip{display:block;text-align:left;width:100%;background:#f0f6f2;border:1px solid #d5e5db;border-radius:6px;padding:8px 10px;margin-top:6px;color:#456359;font-size:11px;line-height:1.5}
 .source-chip:hover{border-color:#72ab93}
+.general-chat{max-width:1300px;margin:0 auto 30px;background:#fff;border:1px solid #e0e8e4;border-radius:10px;padding:24px}
+.general-chat .chat-intro{margin-bottom:16px}
+.general-messages{min-height:180px;max-height:460px;overflow:auto}
+.retry-button{margin-top:8px;border:1px solid #bcd6c8;background:#fff;color:#176b57;border-radius:6px;padding:4px 10px;font-weight:700}
+.retry-button:hover{border-color:#72ab93}

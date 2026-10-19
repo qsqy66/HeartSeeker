@@ -3,3 +3,6 @@ uvicorn[standard]==0.34.0
 pymupdf==1.25.1
 python-multipart==0.0.20
 keyring==25.6.0
+lancedb>=0.9
+pyarrow>=14
+numpy>=1.24

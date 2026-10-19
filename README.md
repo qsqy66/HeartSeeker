@@ -31,7 +31,32 @@
 
 ## 运行
 
-### 1. 启动后端
+### 自动安装（全新机器，推荐）
+
+机器上没装 Python/Node、或版本过旧时，用安装脚本一次性装好环境并直接启动（自动打开浏览器）。只装缺失或过旧的部分，不会改动已满足要求的环境。
+
+**Windows**：双击 `install.bat` —— 用 winget 安装 Python 3.12 + Node.js LTS
+
+**Linux**：`./install.sh` —— 自动识别 apt / dnf / yum / pacman，安装 python3 + venv + nodejs + npm（需要 sudo）
+
+> macOS 暂未提供自动安装脚本，请手动装好 Python/Node 后用下方「一键启动」。
+
+### 一键启动（已装好 Python 和 Node）
+
+首次运行会自动创建 `.venv`、安装后端依赖，并在 `node_modules` 缺失时安装前端依赖；之后再次运行直接复用，启动后端（`127.0.0.1:8765`）与前端（`127.0.0.1:5173`），并自动打开浏览器。按 `Ctrl+C` 一次停止两个服务。
+
+**Windows**：双击 `start.bat`，或在终端运行 `python start.py`
+
+**macOS / Linux**：
+```bash
+python3 start.py            # 或 ./start.sh
+```
+
+> 附加参数：`--no-browser` 只启动不自动打开浏览器；环境变量 `PAPER_READER_PORT` / `PAPER_READER_FRONTEND_PORT` 可覆盖端口。
+
+### 手动启动（可选）
+
+#### 1. 启动后端
 
 **Windows（PowerShell）**
 ```powershell
@@ -49,14 +74,14 @@ pip install -r backend/requirements.txt
 python -m uvicorn backend.app:app --host 127.0.0.1 --port 8765
 ```
 
-### 2. 启动前端
+#### 2. 启动前端
 
 ```powershell
 npm install
 npm run dev
 ```
 
-### 3. 打开
+#### 3. 打开
 
 浏览器访问 <http://localhost:5173>。后端只监听 `127.0.0.1:8765`。
 
@@ -106,6 +131,11 @@ npm run dev
 ## 目录结构
 
 ```
+install.sh           # Linux 环境自动安装（Python + Node.js）
+install.bat          # Windows 环境自动安装（winget）
+start.py             # 一键启动脚本（后端 + 前端）
+start.sh             # Linux / macOS 启动入口
+start.bat            # Windows 启动入口
 backend/
   app.py             # FastAPI 接口：导入/检索/问答/设置
   embedding.py       # DashScope 嵌入 + LanceDB 向量库封装

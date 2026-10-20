@@ -75,22 +75,29 @@ def upsert_chunks(vectors_dir, rows: list[dict[str, Any]]) -> None:
         db.create_table("chunks", data=rows)
 
 
-def search_chunks(vectors_dir, paper_id: int, query_vector: list[float], top_k: int = 8) -> list[dict[str, Any]]:
+def search_chunks(vectors_dir, paper_id: Optional[int], query_vector: list[float],
+                  top_k: int = 8) -> list[dict[str, Any]]:
+    """Search one paper, or the whole library when ``paper_id`` is None."""
     db = _connect(vectors_dir)
     if "chunks" not in db.table_names():
         return []
     table = db.open_table("chunks")
+    query = table.search(query_vector)
+    if paper_id is not None:
+        try:
+            return (
+                query.where(f"paper_id = {int(paper_id)}", prefilter=True)
+                .limit(top_k)
+                .to_list()
+            )
+        except Exception:
+            # Fall back to an unfiltered scan when the where clause is unsupported.
+            results = table.search(query_vector).limit(max(top_k * 4, top_k)).to_list()
+            return [row for row in results if row.get("paper_id") == int(paper_id)][:top_k]
     try:
-        return (
-            table.search(query_vector)
-            .where(f"paper_id = {int(paper_id)}", prefilter=True)
-            .limit(top_k)
-            .to_list()
-        )
+        return query.limit(top_k).to_list()
     except Exception:
-        # Fall back to an unfiltered scan when the where clause is unsupported.
-        results = table.search(query_vector).limit(top_k).to_list()
-        return [row for row in results if row.get("paper_id") == int(paper_id)][:top_k]
+        return []
 
 
 def delete_paper_vectors(vectors_dir, paper_id: int) -> None:

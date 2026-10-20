@@ -1,0 +1,352 @@
+"""Hybrid retrieval over one paper or the whole library.
+
+The application stores two complementary indexes:
+
+* SQLite FTS5 for literal terms (strong for English medical jargon)
+* LanceDB vectors for semantic recall (strong for paraphrases and Chinese)
+
+This module fuses both rankings with Reciprocal Rank Fusion (RRF), keeps the
+source rank for each hit, and returns enough metadata for page/bbox provenance.
+It deliberately has no FastAPI dependency so it can be unit tested directly.
+"""
+from __future__ import annotations
+
+import re
+import sqlite3
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+from .credentials import safe_key
+from .embedding import DEFAULT_EMBED_MODEL, embed_texts, normalize, search_chunks
+
+RRF_K = 60
+CJK_RE = re.compile(r"[㐀-鿿]")
+TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]+|\d+(?:\.\d+)?")
+TERM_SPLIT_RE = re.compile(r"[\s,;，；。！？、/|()（）\[\]【】]+")
+
+
+def connect(db_path: Path | str) -> sqlite3.Connection:
+    connection = sqlite3.connect(str(db_path), timeout=15)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def _has_cjk(text: str) -> bool:
+    return bool(CJK_RE.search(text))
+
+
+def _like(term: str) -> str:
+    return "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def _fts_query(query: str) -> str:
+    tokens = TOKEN_RE.findall(query)
+    if not tokens:
+        return ""
+    return " OR ".join(f'"{token}"' for token in tokens[:12])
+
+
+def keyword_search(query: str, db_path: Path | str, paper_id: Optional[int] = None,
+                   limit: int = 30) -> list[dict[str, Any]]:
+    """Literal search with a CJK-friendly LIKE fallback.
+
+    SQLite's unicode61 tokenizer treats a run of Chinese characters as one
+    token, so FTS5 alone misses most Chinese queries.  For CJK we use LIKE on
+    the whole phrase and on short terms; for English we use FTS5 with OR for
+    better recall.
+    """
+    query = query.strip()
+    if not query:
+        return []
+    connection = connect(db_path)
+    try:
+        rows: list[sqlite3.Row] = []
+        fts_query = _fts_query(query)
+        if fts_query and not _has_cjk(query):
+            clause = "AND c.paper_id = ?" if paper_id is not None else ""
+            params: list[Any] = [fts_query]
+            if paper_id is not None:
+                params.insert(0, paper_id)
+            try:
+                rows = connection.execute(
+                    "SELECT c.id, c.paper_id, c.page_id, c.chunk_index, c.text, c.section, c.heading, "
+                    "c.x0, c.y0, c.x1, c.y1, p.page_number, papers.title AS paper_title "
+                    "FROM chunks_fts JOIN chunks c ON chunks_fts.rowid = c.id "
+                    "JOIN pages p ON p.id = c.page_id JOIN papers ON papers.id = c.paper_id "
+                    f"WHERE chunks_fts MATCH ? {clause} "
+                    "ORDER BY p.page_number, c.chunk_index LIMIT ?",
+                    [*params, limit],
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+
+        if not rows:
+            terms = [query]
+            if _has_cjk(query):
+                pieces = [piece for piece in TERM_SPLIT_RE.split(query) if len(piece) >= 2]
+                terms = pieces[:6] or [query]
+            like_clause = " OR ".join(["c.text LIKE ? ESCAPE '\\'"] * len(terms))
+            where = f"({like_clause})"
+            params = [_like(term) for term in terms]
+            if paper_id is not None:
+                where += " AND c.paper_id = ?"
+                params.append(paper_id)
+            rows = connection.execute(
+                "SELECT c.id, c.paper_id, c.page_id, c.chunk_index, c.text, c.section, c.heading, "
+                "c.x0, c.y0, c.x1, c.y1, p.page_number, papers.title AS paper_title "
+                "FROM chunks c JOIN pages p ON p.id = c.page_id JOIN papers ON papers.id = c.paper_id "
+                f"WHERE {where} ORDER BY p.page_number, c.chunk_index LIMIT ?",
+                [*params, limit],
+            ).fetchall()
+        return [_row_to_chunk(row, source="keyword") for row in rows]
+    finally:
+        connection.close()
+
+
+def vector_search(query: str, db_path: Path | str, vectors_dir: Path | str,
+                  paper_id: Optional[int] = None, limit: int = 30,
+                  api_key: Optional[str] = None, embedding_model: Optional[str] = None,
+                  enable_vectors: bool = True) -> list[dict[str, Any]]:
+    if not enable_vectors:
+        return []
+    key = api_key if api_key is not None else safe_key("qwen")
+    if not key:
+        return []
+    if embedding_model is None:
+        embedding_model = _embedding_model(db_path)
+    try:
+        vector = normalize(embed_texts([query], key, embedding_model)[0])
+        rows = search_chunks(Path(vectors_dir), paper_id, vector, limit)
+    except Exception:
+        return []  # retrieval must degrade to keyword search, never break a request
+    return [_row_to_chunk(row, source="vector") for row in rows]
+
+
+def _embedding_model(db_path: Path | str) -> str:
+    try:
+        connection = connect(db_path)
+        try:
+            row = connection.execute(
+                "SELECT value FROM settings WHERE key='embedding_model'"
+            ).fetchone()
+        finally:
+            connection.close()
+        value = row["value"].strip() if row and row["value"].strip() else ""
+        return value or DEFAULT_EMBED_MODEL
+    except sqlite3.Error:
+        return DEFAULT_EMBED_MODEL
+
+
+def _row_to_chunk(row: Any, source: str, score: Optional[float] = None) -> dict[str, Any]:
+    get = row.get if hasattr(row, "get") else lambda key, default=None: row[key] if key in row.keys() else default
+    chunk_id = get("id") if get("id") is not None else get("chunk_id")
+    return {
+        "id": int(chunk_id) if chunk_id is not None else None,
+        "chunk_id": int(chunk_id) if chunk_id is not None else None,
+        "paper_id": int(get("paper_id")) if get("paper_id") is not None else None,
+        "page_number": int(get("page_number")) if get("page_number") is not None else None,
+        "text": get("text") or "",
+        "section": get("section") or "",
+        "heading": get("heading") or "",
+        "paper_title": get("paper_title") or "",
+        "x0": get("x0"), "y0": get("y0"), "x1": get("x1"), "y1": get("y1"),
+        "distance": get("_distance"),
+        "score": score,
+        "sources": [source],
+    }
+
+
+def rrf_fuse(result_lists: Iterable[tuple[str, list[dict[str, Any]]]],
+             weights: Optional[dict[str, float]] = None, k: int = RRF_K) -> list[dict[str, Any]]:
+    """Fuse ranked lists by reciprocal rank, deduplicating by chunk id."""
+    weights = weights or {}
+    merged: dict[int, dict[str, Any]] = {}
+    for source, rows in result_lists:
+        weight = weights.get(source, 1.0)
+        for rank, row in enumerate(rows, start=1):
+            chunk_id = row.get("id")
+            if chunk_id is None:
+                continue
+            contribution = weight / (k + rank)
+            current = merged.get(chunk_id)
+            if current is None:
+                current = dict(row)
+                current["score"] = 0.0
+                current["sources"] = []
+                merged[chunk_id] = current
+            current["score"] = float(current.get("score") or 0.0) + contribution
+            if source not in current["sources"]:
+                current["sources"].append(source)
+            if row.get("distance") is not None:
+                current["distance"] = row["distance"]
+    return sorted(merged.values(), key=lambda item: item["score"], reverse=True)
+
+
+def _canonical_chunks(db_path: Path | str, chunk_ids: list[int]) -> dict[int, dict[str, Any]]:
+    if not chunk_ids:
+        return {}
+    placeholders = ",".join("?" for _ in chunk_ids)
+    connection = connect(db_path)
+    try:
+        rows = connection.execute(
+            "SELECT c.id, c.paper_id, c.page_id, c.chunk_index, c.text, c.section, c.heading, "
+            "c.x0, c.y0, c.x1, c.y1, p.page_number, papers.title AS paper_title "
+            "FROM chunks c JOIN pages p ON p.id = c.page_id JOIN papers ON papers.id = c.paper_id "
+            f"WHERE c.id IN ({placeholders})",
+            chunk_ids,
+        ).fetchall()
+    finally:
+        connection.close()
+    return {int(row["id"]): _row_to_chunk(row, source="canonical") for row in rows}
+
+
+def hybrid_search(query: str, db_path: Path | str, vectors_dir: Path | str,
+                  paper_id: Optional[int] = None, top_k: int = 8, candidate_k: int = 30,
+                  api_key: Optional[str] = None, embedding_model: Optional[str] = None,
+                  enable_vectors: bool = True) -> list[dict[str, Any]]:
+    """Return the best chunks from both indexes, fused and provenance-enriched."""
+    query = query.strip()
+    if not query:
+        return []
+    keyword_rows = keyword_search(query, db_path, paper_id, candidate_k)
+    vector_rows = vector_search(
+        query, db_path, vectors_dir, paper_id, candidate_k,
+        api_key=api_key, embedding_model=embedding_model, enable_vectors=enable_vectors,
+    )
+    fused = rrf_fuse([("vector", vector_rows), ("keyword", keyword_rows)],
+                     weights={"vector": 1.0, "keyword": 0.9})[:top_k]
+    canonical = _canonical_chunks(db_path, [row["id"] for row in fused if row.get("id")])
+    results: list[dict[str, Any]] = []
+    for row in fused:
+        canonical_row = canonical.get(int(row["id"])) if row.get("id") is not None else None
+        if canonical_row is None:
+            continue
+        canonical_row["score"] = round(float(row["score"]), 6)
+        canonical_row["sources"] = row["sources"]
+        if row.get("distance") is not None:
+            canonical_row["distance"] = row["distance"]
+        results.append(canonical_row)
+    return results
+
+
+def library_search(query: str, db_path: Path | str, vectors_dir: Path | str,
+                   top_k: int = 8, **kwargs: Any) -> list[dict[str, Any]]:
+    return hybrid_search(query, db_path, vectors_dir, paper_id=None, top_k=top_k, **kwargs)
+
+
+def read_page(db_path: Path | str, paper_id: int, page_number: int) -> dict[str, Any]:
+    connection = connect(db_path)
+    try:
+        row = connection.execute(
+            "SELECT p.page_number, p.text, papers.title AS paper_title "
+            "FROM pages p JOIN papers ON papers.id = p.paper_id "
+            "WHERE p.paper_id = ? AND p.page_number = ?",
+            (paper_id, page_number),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise LookupError("页码不存在")
+    return {"paper_id": paper_id, "page_number": int(row["page_number"]),
+            "paper_title": row["paper_title"], "text": row["text"]}
+
+
+def read_section(db_path: Path | str, paper_id: int, heading: str,
+                 limit: int = 8) -> list[dict[str, Any]]:
+    connection = connect(db_path)
+    try:
+        rows = connection.execute(
+            "SELECT c.id, c.paper_id, c.page_id, c.chunk_index, c.text, c.section, c.heading, "
+            "c.x0, c.y0, c.x1, c.y1, p.page_number, papers.title AS paper_title "
+            "FROM chunks c JOIN pages p ON p.id = c.page_id JOIN papers ON papers.id = c.paper_id "
+            "WHERE c.paper_id = ? AND (c.heading LIKE ? OR c.section LIKE ?) "
+            "ORDER BY p.page_number, c.chunk_index LIMIT ?",
+            (paper_id, _like(heading), _like(heading), limit),
+        ).fetchall()
+        if not rows:
+            rows = connection.execute(
+                "SELECT c.id, c.paper_id, c.page_id, c.chunk_index, c.text, c.section, c.heading, "
+                "c.x0, c.y0, c.x1, c.y1, p.page_number, papers.title AS paper_title "
+                "FROM chunks c JOIN pages p ON p.id = c.page_id JOIN papers ON papers.id = c.paper_id "
+                "WHERE c.paper_id = ? AND c.text LIKE ? ESCAPE '\\' "
+                "ORDER BY p.page_number, c.chunk_index LIMIT ?",
+                (paper_id, _like(heading), limit),
+            ).fetchall()
+    finally:
+        connection.close()
+    return [_row_to_chunk(row, source="keyword") for row in rows]
+
+
+def compare_papers(db_path: Path | str, vectors_dir: Path | str,
+                   paper_ids: list[int], aspects: list[str],
+                   top_k_each: int = 4, **kwargs: Any) -> list[dict[str, Any]]:
+    comparison: list[dict[str, Any]] = []
+    for paper_id in paper_ids[:5]:
+        connection = connect(db_path)
+        try:
+            paper = connection.execute("SELECT title FROM papers WHERE id=?", (paper_id,)).fetchone()
+        finally:
+            connection.close()
+        if paper is None:
+            comparison.append({"paper_id": paper_id, "paper_title": "", "aspect": "", "chunks": [],
+                               "error": "论文不存在"})
+            continue
+        for aspect in aspects[:3]:
+            chunks = hybrid_search(aspect, db_path, vectors_dir, paper_id=paper_id,
+                                   top_k=top_k_each, **kwargs)
+            comparison.append({"paper_id": paper_id, "paper_title": paper["title"],
+                               "aspect": aspect, "chunks": chunks})
+    return comparison
+
+
+def build_context(rows: list[dict[str, Any]], max_chars: int = 30000,
+                  per_row_chars: int = 1800) -> str:
+    """Render retrieved chunks into a bounded, clearly delimited context block."""
+    parts: list[str] = []
+    used = 0
+    seen: set[int] = set()
+    for row in rows:
+        chunk_id = row.get("id")
+        if chunk_id is not None and int(chunk_id) in seen:
+            continue
+        if chunk_id is not None:
+            seen.add(int(chunk_id))
+        text = (row.get("text") or "").strip()
+        if not text:
+            continue
+        header = f"[Paper: {row.get('paper_title') or '未命名'}] [Page {row.get('page_number')}] {row.get('section') or row.get('heading') or '正文'}"
+        block = header + "\n" + text[:per_row_chars]
+        if used + len(block) > max_chars:
+            break
+        parts.append(block)
+        used += len(block) + 2
+    return "\n\n".join(parts)
+
+
+def to_sources(rows: list[dict[str, Any]], text_chars: int = 1200) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    for row in rows:
+        sources.append({
+            "id": row.get("id"),
+            "chunk_id": row.get("id"),
+            "paper_id": row.get("paper_id"),
+            "paper_title": row.get("paper_title", ""),
+            "page_number": row.get("page_number"),
+            "text": (row.get("text") or "")[:text_chars],
+            "section": row.get("section", ""),
+            "heading": row.get("heading", ""),
+            "x0": row.get("x0"), "y0": row.get("y0"),
+            "x1": row.get("x1"), "y1": row.get("y1"),
+            "score": row.get("score"),
+            "sources": row.get("sources", []),
+        })
+    return sources
+
+
+def paper_exists(db_path: Path | str, paper_id: int) -> bool:
+    connection = connect(db_path)
+    try:
+        return connection.execute("SELECT 1 FROM papers WHERE id=?", (paper_id,)).fetchone() is not None
+    finally:
+        connection.close()

@@ -18,6 +18,8 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
+from .agent import AgentConfig, AgentError, AgentRunner
+from .credentials import safe_key
 from .embedding import (
     DEFAULT_EMBED_MODEL,
     EmbeddingError,
@@ -27,6 +29,9 @@ from .embedding import (
     search_chunks,
     upsert_chunks,
 )
+from .safety import MEDICAL_SYSTEM_RULES, apply_safety, wrap_untrusted
+from . import retrieval
+from .structured import extract_fields
 
 
 APP_HOME = Path(os.environ.get("PAPER_READER_HOME", Path.home() / "PaperReader"))
@@ -160,6 +165,50 @@ def initialize_storage() -> None:
                 summarized_upto INTEGER NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS paper_analysis (
+                paper_id INTEGER PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
+                content_hash TEXT NOT NULL,
+                provider TEXT,
+                model TEXT,
+                prompt_version TEXT NOT NULL,
+                fields_json TEXT NOT NULL,
+                source TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS agent_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                paper_id INTEGER,
+                mode TEXT NOT NULL,
+                question TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                provider TEXT,
+                model TEXT,
+                verified INTEGER NOT NULL DEFAULT 0,
+                citation_level TEXT,
+                trace_json TEXT NOT NULL DEFAULT '[]',
+                citations_json TEXT NOT NULL DEFAULT '[]',
+                warnings_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS agent_steps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                step_index INTEGER NOT NULL,
+                thought TEXT,
+                tool TEXT,
+                args_json TEXT,
+                observation_json TEXT,
+                duration_ms INTEGER,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_run_id INTEGER,
+                paper_id INTEGER,
+                rating INTEGER NOT NULL,
+                comment TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
             """
         )
         # Migrate databases created by earlier V1 versions without making startup fragile.
@@ -172,6 +221,11 @@ def initialize_storage() -> None:
         _ensure_column(connection, "chunks", "y1", "y1 REAL")
         _ensure_column(connection, "chunks", "section", "section TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "chunks", "heading", "heading TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "papers", "embedding_model", "embedding_model TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "papers", "embedding_dim", "embedding_dim INTEGER")
+        _ensure_column(connection, "papers", "progress_stage", "progress_stage TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "papers", "progress_current", "progress_current INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(connection, "papers", "progress_total", "progress_total INTEGER NOT NULL DEFAULT 0")
 
 
 # --- Structured PDF extraction --------------------------------------------------------
@@ -346,11 +400,16 @@ def _safe_delete_vectors(paper_id: int) -> None:
 def _clean_chunks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     cleaned: list[dict[str, Any]] = []
     for row in rows:
+        score = row.get("_distance")
+        if score is None:
+            score = row.get("score")
         cleaned.append({
             "id": row["id"], "text": row["text"], "page_number": row["page_number"],
             "section": row.get("section", "") or "", "heading": row.get("heading", "") or "",
             "x0": row.get("x0"), "y0": row.get("y0"), "x1": row.get("x1"), "y1": row.get("y1"),
-            "score": round(float(row["_distance"]), 4) if row.get("_distance") is not None else None,
+            "score": round(float(score), 4) if score is not None else None,
+            "paper_id": row.get("paper_id"), "paper_title": row.get("paper_title", ""),
+            "sources": row.get("sources", []),
         })
     return cleaned
 
@@ -368,9 +427,9 @@ def _retrieve_chunks(paper_id: int, query: str, top_k: int = 8) -> list[dict[str
 
 
 def _rag_context(paper_id: int, message: str) -> tuple[str, list[dict[str, Any]]]:
-    rows = _retrieve_chunks(paper_id, message, 10)
+    rows = retrieval.hybrid_search(message, DB_PATH, VECTORS_DIR, paper_id=paper_id, top_k=10)
     if rows:
-        return "\n".join(f"[Page {row['page_number']}] {row['text'][:1500]}" for row in rows)[:30000], rows
+        return retrieval.build_context(rows, max_chars=30000, per_row_chars=1800), rows
     return _paper_context(paper_id), []
 
 
@@ -411,15 +470,18 @@ def _process_document(paper_id: int, document) -> None:
                 })
 
     vectorized = 0
+    embedding_model = ""
+    embedding_dim: Optional[int] = None
     if chunk_rows:
         key = _safe_qwen_key()
         if key:
             try:
-                model = _embedding_model()
-                vectors = embed_texts([row["text"] for row in chunk_rows], key, model)
+                embedding_model = _embedding_model()
+                vectors = embed_texts([row["text"] for row in chunk_rows], key, embedding_model)
                 for row, vector in zip(chunk_rows, vectors):
                     row["vector"] = normalize(vector)
                 upsert_chunks(VECTORS_DIR, chunk_rows)
+                embedding_dim = len(vectors[0]) if vectors else None
                 vectorized = 1
             except Exception:
                 vectorized = 0  # embedding failure must not block reading/FTS
@@ -427,8 +489,9 @@ def _process_document(paper_id: int, document) -> None:
     needs_ocr = 0 if total_chars else 1
     with get_connection() as connection:
         connection.execute(
-            "UPDATE papers SET page_count=?, status='ready', vectorized=?, needs_ocr=? WHERE id=?",
-            (len(document), vectorized, needs_ocr, paper_id),
+            "UPDATE papers SET page_count=?, status='ready', vectorized=?, needs_ocr=?, "
+            "embedding_model=?, embedding_dim=? WHERE id=?",
+            (len(document), vectorized, needs_ocr, embedding_model, embedding_dim, paper_id),
         )
 
 
@@ -461,6 +524,16 @@ class ChatPayload(BaseModel):
     question: str = Field(default="", max_length=12000)
     provider: Optional[str] = None
     stream: bool = False
+    retry: bool = False
+
+
+class AgentChatPayload(BaseModel):
+    message: str = Field(default="", max_length=12000)
+    question: str = Field(default="", max_length=12000)
+    paper_id: Optional[int] = None
+    mode: str = "auto"  # auto | paper | library | general
+    provider: Optional[str] = None
+    stream: bool = True
     retry: bool = False
 
 
@@ -645,18 +718,18 @@ def _general_conversation_state(provider: str, key: str, model: str) -> tuple[st
 
 
 def _build_paper_prompt(summary: str, recent: list[dict[str, Any]], context: str, message: str) -> str:
-    parts = ["你是医学论文精读助手。用户正在针对同一篇论文连续提问，请结合对话历史理解用户问题中的指代和上下文。仅依据下面给出的论文内容回答；必须在回答中引用一个或多个 [Page N] 页码；不确定时明确说无法从论文判断。"]
+    parts = ["你是医学论文精读助手。用户正在针对同一篇论文连续提问，请结合对话历史理解用户问题中的指代和上下文。仅依据下面给出的论文内容回答；必须在回答中引用一个或多个 [Page N] 页码；不确定时明确说无法从论文判断。\n" + MEDICAL_SYSTEM_RULES]
     if summary:
         parts.append("【历史对话摘要】\n" + summary)
     if recent:
         parts.append("【最近对话】\n" + _format_turns(recent))
-    parts.append("【论文内容】\n" + context)
+    parts.append("【论文内容】\n" + wrap_untrusted(context))
     parts.append("【当前问题】\n" + message)
     return "\n\n".join(parts)
 
 
 def _build_general_prompt(summary: str, recent: list[dict[str, Any]], message: str) -> str:
-    parts = ["你是面向医学生的临床医学学习助手，用清晰、准确、易懂的语言回答；涉及医学事实时尽量严谨，不确定时如实说明。请结合对话历史理解用户的追问和指代。"]
+    parts = ["你是面向医学生的临床医学学习助手，用清晰、准确、易懂的语言回答；涉及医学事实时尽量严谨，不确定时如实说明。请结合对话历史理解用户的追问和指代。\n" + MEDICAL_SYSTEM_RULES]
     if summary:
         parts.append("【历史对话摘要】\n" + summary)
     if recent:
@@ -681,6 +754,7 @@ def _paper_chat_stream(paper_id: int, provider: str, key: str, model: str, promp
     except HTTPException as error:
         yield json.dumps({"error": error.detail}, ensure_ascii=False) + "\n"
         return
+    answer, _ = apply_safety(answer, message)
     with get_connection() as connection:
         cursor = connection.execute("INSERT INTO chat_messages(paper_id,role,content,provider,created_at) VALUES(?,?,?,?,?)",
                                      (paper_id, "assistant", answer, provider, utc_now()))
@@ -691,7 +765,7 @@ def _paper_chat_stream(paper_id: int, provider: str, key: str, model: str, promp
                       "citations": citations, "sources": _clean_chunks(retrieved)}, ensure_ascii=False) + "\n"
 
 
-def _general_chat_stream(provider: str, key: str, model: str, prompt: str):
+def _general_chat_stream(provider: str, key: str, model: str, prompt: str, question: str = ""):
     parts: list[str] = []
     try:
         for delta in _stream_provider_chat(provider, key, prompt, model):
@@ -704,6 +778,7 @@ def _general_chat_stream(provider: str, key: str, model: str, prompt: str):
     if not answer:
         yield json.dumps({"error": "模型返回了空响应"}, ensure_ascii=False) + "\n"
         return
+    answer, _ = apply_safety(answer, question)
     with get_connection() as connection:
         cursor = connection.execute("INSERT INTO general_messages(role,content,provider,created_at) VALUES(?,?,?,?)",
                                      ("assistant", answer, provider, utc_now()))
@@ -739,6 +814,165 @@ def list_papers() -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def _search_payload(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{**chunk, "source": "hybrid"} for chunk in _clean_chunks(rows)]
+
+
+@app.get("/api/library/search")
+def library_search(q: str, top_k: int = 8) -> list[dict[str, Any]]:
+    """Hybrid search across every imported paper."""
+    query = q.strip()
+    if not query:
+        return []
+    top_k = max(1, min(top_k, 50))
+    rows = retrieval.library_search(query, DB_PATH, VECTORS_DIR, top_k=top_k)
+    return _search_payload(rows)
+
+
+def _store_agent_message(mode: str, paper_id: Optional[int], role: str,
+                         content: str, provider: str) -> None:
+    if not content.strip():
+        return
+    with get_connection() as connection:
+        if mode == "paper":
+            if paper_id is None:
+                return
+            connection.execute(
+                "INSERT INTO chat_messages(paper_id,role,content,provider,created_at) VALUES(?,?,?,?,?)",
+                (paper_id, role, content, provider, utc_now()),
+            )
+        else:
+            connection.execute(
+                "INSERT INTO general_messages(role,content,provider,created_at) VALUES(?,?,?,?,?)",
+                (role, content, provider, utc_now()),
+            )
+
+
+def _agent_history(mode: str, paper_id: Optional[int], retry: bool,
+                   message: str) -> list[dict[str, Any]]:
+    with get_connection() as connection:
+        if mode == "paper" and paper_id is not None:
+            rows = connection.execute(
+                "SELECT role,content FROM chat_messages WHERE paper_id=? ORDER BY id DESC LIMIT 20",
+                (paper_id,),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT role,content FROM general_messages ORDER BY id DESC LIMIT 20"
+            ).fetchall()
+    history = [dict(row) for row in reversed(rows)]
+    if retry and history and history[-1]["role"] == "user" \
+            and history[-1]["content"].strip() == message:
+        history = history[:-1]
+    return history
+
+
+@app.post("/api/agent/chat")
+def agent_chat(payload: AgentChatPayload):
+    """Run the tool-using agent over a paper, the library, or general knowledge."""
+    message = (payload.message or payload.question).strip()
+    if not message:
+        raise HTTPException(400, "问题不能为空")
+    provider = (payload.provider or _default_provider()).lower()
+    if provider not in PROVIDERS:
+        raise HTTPException(400, "provider 必须是 deepseek 或 qwen")
+    key = _key_store(provider)
+    if not key:
+        raise HTTPException(400, f"{provider} 尚未配置 API key")
+    model = _resolve_model(provider)
+
+    mode = (payload.mode or "auto").lower().strip()
+    if mode not in {"auto", "paper", "library", "general"}:
+        raise HTTPException(400, "mode 必须是 auto / paper / library / general")
+    paper_id = payload.paper_id
+    if mode == "auto":
+        if paper_id is not None:
+            mode = "paper"
+        else:
+            with get_connection() as connection:
+                has_papers = connection.execute("SELECT 1 FROM papers LIMIT 1").fetchone() is not None
+            mode = "library" if has_papers else "general"
+    if mode == "paper":
+        if paper_id is None:
+            raise HTTPException(400, "论文内问答需要 paper_id")
+        if not retrieval.paper_exists(DB_PATH, paper_id):
+            raise HTTPException(404, "论文不存在")
+    elif paper_id is not None:
+        mode = "paper"
+
+    history = _agent_history(mode, paper_id, payload.retry, message)
+    config = AgentConfig(provider=provider, key=key, model=model, mode=mode,
+                         paper_id=paper_id, history=history)
+    runner = AgentRunner(config, DB_PATH, VECTORS_DIR)
+
+    if not payload.stream:
+        try:
+            done = runner.run(message)
+        except AgentError as error:
+            raise HTTPException(502, str(error)) from error
+        if not payload.retry:
+            _store_agent_message(mode, paper_id, "user", message, provider)
+        _store_agent_message(mode, paper_id, "assistant", done.get("content", ""), provider)
+        return done
+
+    if not payload.retry:
+        _store_agent_message(mode, paper_id, "user", message, provider)
+
+    def generate():
+        for event in runner.run_iter(message):
+            if event.get("type") == "done":
+                _store_agent_message(mode, paper_id, "assistant", event.get("content", ""), provider)
+            yield json.dumps(event, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
+@app.get("/api/agent/runs/{run_id}")
+def get_agent_run(run_id: int) -> dict[str, Any]:
+    with get_connection() as connection:
+        run = connection.execute("SELECT * FROM agent_runs WHERE id=?", (run_id,)).fetchone()
+        if run is None:
+            raise HTTPException(404, "Agent 运行记录不存在")
+        steps = connection.execute(
+            "SELECT step_index,thought,tool,args_json,observation_json,duration_ms,created_at "
+            "FROM agent_steps WHERE run_id=? ORDER BY step_index", (run_id,)
+        ).fetchall()
+    data = dict(run)
+    for key in ("trace_json", "citations_json", "warnings_json"):
+        try:
+            data[key] = json.loads(data[key])
+        except (TypeError, ValueError):
+            data[key] = []
+    step_rows = []
+    for step in steps:
+        item = dict(step)
+        for key in ("args_json", "observation_json"):
+            try:
+                item[key] = json.loads(item[key])
+            except (TypeError, ValueError):
+                item[key] = {}
+        step_rows.append(item)
+    return {"run": data, "steps": step_rows}
+
+
+class FeedbackPayload(BaseModel):
+    agent_run_id: Optional[int] = None
+    paper_id: Optional[int] = None
+    rating: int = Field(ge=-1, le=1)
+    comment: str = Field(default="", max_length=4000)
+
+
+@app.post("/api/feedback")
+def add_feedback(payload: FeedbackPayload) -> dict[str, Any]:
+    with get_connection() as connection:
+        cursor = connection.execute(
+            "INSERT INTO feedback(agent_run_id,paper_id,rating,comment,created_at) VALUES(?,?,?,?,?)",
+            (payload.agent_run_id, payload.paper_id, payload.rating,
+             payload.comment.strip(), utc_now()),
+        )
+    return {"id": cursor.lastrowid, "status": "saved"}
+
+
 @app.get("/api/papers/{paper_id}")
 def get_paper(paper_id: int) -> dict[str, Any]:
     with get_connection() as connection:
@@ -767,33 +1001,41 @@ def get_paper(paper_id: int) -> dict[str, Any]:
             "pages": [dict(page) for page in pages], "text_blocks": [dict(block) for block in blocks]}
 
 
-@app.get("/api/papers/{paper_id}/structured")
-def structured_paper(paper_id: int) -> dict[str, Any]:
+def _structured_analysis(paper_id: int, force_llm: bool) -> dict[str, Any]:
     _paper_context(paper_id)
-    fields: dict[str, dict[str, Any]] = {}
-    patterns = {
-        "研究设计": r"\b(randomized controlled trial|randomized clinical trial|cohort study|case-control study|cross-sectional study|systematic review|meta-analysis)\b",
-        "样本量": r"\b(?:n\s*=\s*|sample size of\s+)(\d[\d,]*)",
-        "统计方法": r"\b(odds ratio|hazard ratio|relative risk|confidence interval|p\s*[<=>])\b",
-        "关键结果": r"\b(primary outcome|primary endpoint|main outcome)\b",
-        "局限性": r"\b(limitations?|limitation of this study)\b",
-    }
-    with get_connection() as connection:
-        rows = connection.execute(
-            "SELECT chunks.id, chunks.text, pages.page_number, chunks.x0, chunks.y0, chunks.x1, chunks.y1, chunks.section "
-            "FROM chunks JOIN pages ON pages.id=chunks.page_id WHERE chunks.paper_id=? ORDER BY pages.page_number,chunks.id",
-            (paper_id,),
-        ).fetchall()
-    for name, pattern in patterns.items():
-        matches = [dict(row) for row in rows if re.search(pattern, row["text"], re.IGNORECASE)]
-        fields[name] = {
-            "value": matches[0]["text"][:500] if matches else "论文未明确报告",
-            "evidence": [{"id": row["id"], "text": row["text"], "page_number": row["page_number"],
-                          "x0": row["x0"], "y0": row["y0"], "x1": row["x1"], "y1": row["y1"]} for row in matches[:3]],
-        }
-    for name in ("一句话总结", "Population", "Intervention / Exposure", "Comparator", "Outcomes"):
-        fields.setdefault(name, {"value": "论文未明确报告", "evidence": []})
-    return {"fields": fields}
+    provider = _default_provider()
+    key = safe_key(provider) or ""
+    model = _resolve_model(provider)
+    analysis = extract_fields(paper_id, DB_PATH, provider, key, model,
+                              force=force_llm, use_llm=bool(key) and force_llm)
+    analysis["provider"] = provider
+    analysis["model"] = model
+    analysis["llm_available"] = bool(key)
+    return analysis
+
+
+@app.get("/api/papers/{paper_id}/structured")
+def structured_paper(paper_id: int, refresh: bool = False) -> dict[str, Any]:
+    """Return cached LLM extraction when available, otherwise heuristic fields.
+
+    A normal page load never spends an LLM call.  ``POST`` or ``?refresh=true``
+    explicitly asks for a fresh structured reading.
+    """
+    try:
+        return _structured_analysis(paper_id, force_llm=refresh)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@app.post("/api/papers/{paper_id}/structured")
+def refresh_structured_paper(paper_id: int) -> dict[str, Any]:
+    provider = _default_provider()
+    if not safe_key(provider):
+        raise HTTPException(400, "请先在设置中配置问答模型 API Key")
+    try:
+        return _structured_analysis(paper_id, force_llm=True)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
 
 
 @app.post("/api/papers/import")
@@ -890,9 +1132,10 @@ def retrieve_paper(paper_id: int, q: str, top_k: int = 8) -> list[dict[str, Any]
         return []
     _paper_context(paper_id)
     top_k = max(1, min(top_k, 50))
-    rows = _retrieve_chunks(paper_id, query, top_k)
+    rows = retrieval.hybrid_search(query, DB_PATH, VECTORS_DIR, paper_id=paper_id, top_k=top_k)
     if rows:
-        return [{**chunk, "source": "vector"} for chunk in _clean_chunks(rows)]
+        return [{**chunk, "source": "hybrid", "sources": chunk.get("sources", [])}
+                for chunk in _clean_chunks(rows)]
     return search_paper(paper_id, query)
 
 
@@ -1058,7 +1301,9 @@ def chat(paper_id: int, payload: ChatPayload) -> dict[str, Any]:
             connection.execute("INSERT INTO chat_messages(paper_id,role,content,provider,created_at) VALUES(?,?,?,?,?)",
                                (paper_id, "user", message, provider, utc_now()))
     prompt = _build_paper_prompt(summary, recent, context, message)
-    grounding = context + "\n" + _format_turns(recent) + ("\n" + summary if summary else "")
+    # Citations must be grounded in the retrieved paper context, never in the
+    # conversation itself; otherwise an old page marker could validate a new claim.
+    grounding = context
     if payload.stream:
         return StreamingResponse(
             _paper_chat_stream(paper_id, provider, key, model, prompt, message, grounding, retrieved),
@@ -1066,6 +1311,7 @@ def chat(paper_id: int, payload: ChatPayload) -> dict[str, Any]:
         )
     raw = _provider_chat(provider, key, prompt, model)
     answer = _grounded_response(message, raw, grounding)
+    answer, _ = apply_safety(answer, message)
     with get_connection() as connection:
         cursor = connection.execute("INSERT INTO chat_messages(paper_id,role,content,provider,created_at) VALUES(?,?,?,?,?)",
                                      (paper_id, "assistant", answer, provider, utc_now()))
@@ -1111,12 +1357,13 @@ def general_chat(payload: ChatPayload) -> dict[str, Any]:
     prompt = _build_general_prompt(summary, recent, message)
     if payload.stream:
         return StreamingResponse(
-            _general_chat_stream(provider, key, model, prompt),
+            _general_chat_stream(provider, key, model, prompt, message),
             media_type="application/x-ndjson",
         )
     answer = _provider_chat(provider, key, prompt, model).strip()
     if not answer:
         raise HTTPException(502, "模型返回了空响应")
+    answer, _ = apply_safety(answer, message)
     with get_connection() as connection:
         cursor = connection.execute("INSERT INTO general_messages(role,content,provider,created_at) VALUES(?,?,?,?)",
                                      ("assistant", answer, provider, utc_now()))

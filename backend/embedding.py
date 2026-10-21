@@ -12,7 +12,7 @@ import json
 import math
 import urllib.error
 import urllib.request
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 DASHSCOPE_EMBED_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings"
 DEFAULT_EMBED_MODEL = "text-embedding-v3"
@@ -27,12 +27,18 @@ def embed_texts(
     texts: list[str],
     api_key: str,
     model: str = DEFAULT_EMBED_MODEL,
+    on_progress: Optional[Callable[[int, int], None]] = None,
 ) -> list[list[float]]:
-    """Embed a list of texts via DashScope, preserving input order."""
+    """Embed a list of texts via DashScope, preserving input order.
+
+    ``on_progress(done, total)`` is called after every batch so a background
+    import can report embedding progress without knowing the batch size.
+    """
     if not texts:
         return []
     vectors: list[list[float]] = []
-    for start in range(0, len(texts), BATCH_SIZE):
+    total = len(texts)
+    for start in range(0, total, BATCH_SIZE):
         batch = texts[start : start + BATCH_SIZE]
         payload = json.dumps({"model": model, "input": batch}).encode("utf-8")
         request = urllib.request.Request(
@@ -47,6 +53,8 @@ def embed_texts(
             raise EmbeddingError("DashScope 嵌入服务暂不可用") from error
         rows = sorted(data.get("data", []), key=lambda item: item.get("index", 0))
         vectors.extend(row["embedding"] for row in rows)
+        if on_progress is not None:
+            on_progress(min(start + BATCH_SIZE, total), total)
     if len(vectors) != len(texts):
         raise EmbeddingError("嵌入返回数量与输入不一致")
     return vectors

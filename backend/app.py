@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+import logging
 import re
-import sqlite3
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,363 +19,28 @@ from fastapi.responses import StreamingResponse
 
 from .agent import AgentConfig, AgentError, AgentRunner
 from .credentials import safe_key
-from .embedding import (
-    DEFAULT_EMBED_MODEL,
-    EmbeddingError,
-    delete_paper_vectors,
-    embed_texts,
-    normalize,
-    search_chunks,
-    upsert_chunks,
+from .embedding import DEFAULT_EMBED_MODEL, delete_paper_vectors
+from .ingestion import (
+    is_heading as _is_heading,
+    process_document,
+    reindex_document,
 )
 from .safety import MEDICAL_SYSTEM_RULES, apply_safety, wrap_untrusted
+from .storage import APP_HOME, DB_PATH, PAPERS_DIR, VECTORS_DIR, get_connection, initialize_storage, utc_now
 from . import retrieval
 from .structured import extract_fields
 
 
-APP_HOME = Path(os.environ.get("PAPER_READER_HOME", Path.home() / "PaperReader"))
-PAPERS_DIR = APP_HOME / "papers"
-DB_PATH = APP_HOME / "database" / "paper_reader.sqlite3"
-VECTORS_DIR = APP_HOME / "vectors"
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_PAGES = 300
 PROVIDERS = {"deepseek": "https://api.deepseek.com/chat/completions", "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"}
 MODEL_ENDPOINTS = {"deepseek": "https://api.deepseek.com/models", "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1/models"}
 RECENT_TURNS = 10  # 最近 10 轮对话原文保留，更早的历史压缩为摘要
+LOGGER = logging.getLogger("paper_reader.ingestion")
 
-# --- Structured extraction heuristics -------------------------------------------------
-
-HEADING_RE = re.compile(
-    r"^(?:abstract|introduction|background|methods?|materials?\s+and\s+methods|"
-    r"results?|discussion|conclusions?|references?|limitations?|acknowledg?ments?|"
-    r"outcomes?|study\s+design|statistical\s+analysis|participants|population|"
-    r"interventions?|comparators?|ethics|funding|conflicts?\s+of\s+interest)\b",
-    re.IGNORECASE,
-)
-CHINESE_HEADING_RE = re.compile(
-    r"^(?:摘要|引言|背景|方法|材料与方法|结果|讨论|结论|参考文献|局限性|"
-    r"研究设计|统计分析|研究对象|干预措施|对照组|结局指标|伦理|资助|利益冲突)"
-)
-NUMBERED_RE = re.compile(r"^\d+(?:\.\d+)*\.?\s+\S")
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def get_connection() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
-
-
-def _ensure_column(connection: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
-    columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
-    if column not in columns:
-        connection.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
-
-
-def initialize_storage() -> None:
-    for directory in (PAPERS_DIR, DB_PATH.parent, VECTORS_DIR, APP_HOME / "cache", APP_HOME / "exports", APP_HOME / "logs"):
-        directory.mkdir(parents=True, exist_ok=True)
-    with get_connection() as connection:
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS papers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                file_name TEXT NOT NULL,
-                stored_path TEXT NOT NULL,
-                sha256 TEXT NOT NULL UNIQUE,
-                page_count INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                error_message TEXT,
-                imported_at TEXT NOT NULL,
-                vectorized INTEGER NOT NULL DEFAULT 0,
-                needs_ocr INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS pages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
-                page_number INTEGER NOT NULL,
-                text TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS chunks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
-                page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
-                chunk_index INTEGER NOT NULL,
-                text TEXT NOT NULL,
-                x0 REAL, y0 REAL, x1 REAL, y1 REAL,
-                section TEXT NOT NULL DEFAULT '',
-                heading TEXT NOT NULL DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS paper_metadata (
-                paper_id INTEGER PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
-                authors TEXT NOT NULL DEFAULT '[]', abstract TEXT NOT NULL DEFAULT '',
-                year INTEGER, doi TEXT, keywords TEXT NOT NULL DEFAULT '[]'
-            );
-            CREATE TABLE IF NOT EXISTS evidence (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
-                chunk_id INTEGER REFERENCES chunks(id) ON DELETE SET NULL,
-                quote TEXT NOT NULL, page_number INTEGER, created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS chat_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                paper_id INTEGER REFERENCES papers(id) ON DELETE CASCADE,
-                role TEXT NOT NULL, content TEXT NOT NULL, provider TEXT,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS page_text_blocks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
-                x0 REAL NOT NULL, y0 REAL NOT NULL, x1 REAL NOT NULL, y1 REAL NOT NULL,
-                text TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS api_keys (
-                provider TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
-            );
-            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-                text, content='chunks', content_rowid='id'
-            );
-            CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
-                INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
-            END;
-            CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
-                INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.id, old.text);
-            END;
-            CREATE TABLE IF NOT EXISTS chat_summaries (
-                paper_id INTEGER PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
-                summary TEXT NOT NULL,
-                summarized_upto INTEGER NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS general_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                provider TEXT,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS general_summary (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                summary TEXT NOT NULL,
-                summarized_upto INTEGER NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS paper_analysis (
-                paper_id INTEGER PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
-                content_hash TEXT NOT NULL,
-                provider TEXT,
-                model TEXT,
-                prompt_version TEXT NOT NULL,
-                fields_json TEXT NOT NULL,
-                source TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS agent_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                paper_id INTEGER,
-                mode TEXT NOT NULL,
-                question TEXT NOT NULL,
-                answer TEXT NOT NULL,
-                provider TEXT,
-                model TEXT,
-                verified INTEGER NOT NULL DEFAULT 0,
-                citation_level TEXT,
-                trace_json TEXT NOT NULL DEFAULT '[]',
-                citations_json TEXT NOT NULL DEFAULT '[]',
-                warnings_json TEXT NOT NULL DEFAULT '[]',
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS agent_steps (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id INTEGER NOT NULL,
-                step_index INTEGER NOT NULL,
-                thought TEXT,
-                tool TEXT,
-                args_json TEXT,
-                observation_json TEXT,
-                duration_ms INTEGER,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS feedback (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                agent_run_id INTEGER,
-                paper_id INTEGER,
-                rating INTEGER NOT NULL,
-                comment TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL
-            );
-            """
-        )
-        # Migrate databases created by earlier V1 versions without making startup fragile.
-        _ensure_column(connection, "papers", "metadata_json", "metadata_json TEXT NOT NULL DEFAULT '{}'")
-        _ensure_column(connection, "papers", "vectorized", "vectorized INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(connection, "papers", "needs_ocr", "needs_ocr INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(connection, "chunks", "x0", "x0 REAL")
-        _ensure_column(connection, "chunks", "y0", "y0 REAL")
-        _ensure_column(connection, "chunks", "x1", "x1 REAL")
-        _ensure_column(connection, "chunks", "y1", "y1 REAL")
-        _ensure_column(connection, "chunks", "section", "section TEXT NOT NULL DEFAULT ''")
-        _ensure_column(connection, "chunks", "heading", "heading TEXT NOT NULL DEFAULT ''")
-        _ensure_column(connection, "papers", "embedding_model", "embedding_model TEXT NOT NULL DEFAULT ''")
-        _ensure_column(connection, "papers", "embedding_dim", "embedding_dim INTEGER")
-        _ensure_column(connection, "papers", "progress_stage", "progress_stage TEXT NOT NULL DEFAULT ''")
-        _ensure_column(connection, "papers", "progress_current", "progress_current INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(connection, "papers", "progress_total", "progress_total INTEGER NOT NULL DEFAULT 0")
-
-
-# --- Structured PDF extraction --------------------------------------------------------
-
-def _page_blocks(page) -> list[dict[str, Any]]:
-    """Extract text blocks with bbox, average font size and bold ratio."""
-    data = page.get_text("dict")
-    blocks: list[dict[str, Any]] = []
-    for block in data.get("blocks", []):
-        if block.get("type") != 0:  # skip image blocks (type 1)
-            continue
-        line_texts: list[str] = []
-        total_chars = 0
-        bold_chars = 0
-        size_sum = 0.0
-        for line in block.get("lines", []):
-            spans = line.get("spans", [])
-            line_texts.append("".join(span.get("text", "") for span in spans))
-            for span in spans:
-                text = span.get("text", "")
-                n = len(text)
-                if n:
-                    total_chars += n
-                    if span.get("flags", 0) & 16:  # PyMuPDF flag bit 4 = bold
-                        bold_chars += n
-                    size_sum += float(span.get("size", 0)) * n
-        text = " ".join(part.strip() for part in line_texts if part.strip())
-        if not text:
-            continue
-        bbox = block.get("bbox", (0.0, 0.0, 0.0, 0.0))
-        blocks.append({
-            "x0": float(bbox[0]), "y0": float(bbox[1]),
-            "x1": float(bbox[2]), "y1": float(bbox[3]),
-            "text": text,
-            "size": size_sum / total_chars if total_chars else 0.0,
-            "bold_ratio": bold_chars / total_chars if total_chars else 0.0,
-        })
-    return blocks
-
-
-def _table_to_markdown(rows: list[list[Any]]) -> str:
-    cleaned = [[("" if cell is None else str(cell).strip()) for cell in row] for row in rows]
-    cleaned = [row for row in cleaned if any(cell for cell in row)]
-    if not cleaned:
-        return ""
-    ncol = max(len(row) for row in cleaned)
-    padded = [row + [""] * (ncol - len(row)) for row in cleaned]
-    header, body = padded[0], padded[1:]
-    lines = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * ncol) + " |"]
-    for row in body:
-        lines.append("| " + " | ".join(row) + " |")
-    return "\n".join(lines)
-
-
-def _page_tables(page) -> list[dict[str, Any]]:
-    tables: list[dict[str, Any]] = []
-    try:
-        for table in page.find_tables().tables:
-            md = _table_to_markdown(table.extract())
-            if not md:
-                continue
-            bbox = table.bbox
-            tables.append({"x0": float(bbox[0]), "y0": float(bbox[1]),
-                           "x1": float(bbox[2]), "y1": float(bbox[3]), "text": md})
-    except Exception:
-        pass  # table detection is best-effort; a single bad page must not break import
-    return tables
-
-
-def _reading_order(elements: list[dict[str, Any]], page_width: float) -> list[dict[str, Any]]:
-    """Column-aware reading order for two-column medical papers."""
-    if len(elements) <= 1:
-        return elements
-    xs = sorted(el["x0"] for el in elements)
-    gaps = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]
-    max_gap = max(gaps)
-    if max_gap > max(40.0, page_width * 0.15):
-        split = xs[gaps.index(max_gap)] + 1.0
-        left = [el for el in elements if el["x0"] < split]
-        right = [el for el in elements if el["x0"] >= split]
-        if left and right:
-            return (sorted(left, key=lambda el: (el["y0"], el["x0"]))
-                    + sorted(right, key=lambda el: (el["y0"], el["x0"])))
-    return sorted(elements, key=lambda el: (round(el["y0"] / 12.0), el["x0"]))
-
-
-def _is_heading(el: dict[str, Any], body_size: float) -> bool:
-    text = el["text"].strip()
-    if not text or len(text) > 150:
-        return False
-    if NUMBERED_RE.match(text) or HEADING_RE.match(text) or CHINESE_HEADING_RE.match(text):
-        return True
-    if body_size and el["size"] >= body_size + 0.8 and el["bold_ratio"] >= 0.5:
-        return True
-    return False
-
-
-def _split_text(text: str, x0: float, y0: float, x1: float, y1: float,
-                section: str, heading: str, max_len: int = 1200) -> list[dict[str, Any]]:
-    """Split a long block into sub-chunks that all share the same provenance."""
-    if len(text) <= max_len:
-        return [{"text": text, "x0": x0, "y0": y0, "x1": x1, "y1": y1,
-                 "section": section, "heading": heading}]
-    parts: list[str] = []
-    start = 0
-    while start < len(text):
-        end = min(start + max_len, len(text))
-        if end < len(text):
-            cut = max(text.rfind(". ", start, end), text.rfind("。", start, end))
-            if cut > start + max_len * 0.5:
-                end = cut + 1
-        parts.append(text[start:end])
-        start = end
-    return [{"text": part, "x0": x0, "y0": y0, "x1": x1, "y1": y1,
-             "section": section, "heading": heading} for part in parts]
-
-
-def _extract_page(page, page_number: int) -> tuple[str, list[dict[str, Any]]]:
-    """Return (plain_text, chunks) with structure-aware chunking for one page."""
-    blocks = _page_blocks(page)
-    tables = _page_tables(page)
-    page_width = float(page.rect.width or 612.0)
-    sizes = [b["size"] for b in blocks if b["text"].strip()]
-    body_size = sorted(sizes)[len(sizes) // 2] if sizes else 0.0
-
-    elements: list[dict[str, Any]] = [{**b, "kind": "text"} for b in blocks]
-    for table in tables:
-        elements.append({"x0": table["x0"], "y0": table["y0"], "x1": table["x1"], "y1": table["y1"],
-                         "text": table["text"], "size": body_size or 10.0, "bold_ratio": 0.0, "kind": "table"})
-    ordered = _reading_order(elements, page_width)
-
-    section = ""
-    chunks: list[dict[str, Any]] = []
-    parts: list[str] = []
-    for el in ordered:
-        text = el["text"].strip()
-        if not text:
-            continue
-        if el["kind"] == "text" and _is_heading(el, body_size):
-            section = text
-            chunks.extend(_split_text(text, el["x0"], el["y0"], el["x1"], el["y1"], text, text))
-            parts.append(text)
-        else:
-            chunks.extend(_split_text(text, el["x0"], el["y0"], el["x1"], el["y1"], section, ""))
-            parts.append(text)
-    return "\n\n".join(parts), chunks
-
+# One worker keeps CPU/embedding-heavy imports serialized while the API stays
+# responsive; imports are durable in SQLite, so a crash is recoverable via retry.
+_IMPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="paper-import")
 
 # --- Storage + embedding helpers ------------------------------------------------------
 
@@ -418,18 +82,6 @@ def _clean_chunks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return cleaned
 
 
-def _retrieve_chunks(paper_id: int, query: str, top_k: int = 8) -> list[dict[str, Any]]:
-    key = _safe_qwen_key()
-    if not key:
-        return []
-    try:
-        model = _embedding_model()
-        vector = embed_texts([query], key, model)[0]
-        return search_chunks(VECTORS_DIR, paper_id, normalize(vector), top_k)
-    except Exception:
-        return []
-
-
 def _rag_context(paper_id: int, message: str) -> tuple[str, list[dict[str, Any]]]:
     rows = retrieval.hybrid_search(message, DB_PATH, VECTORS_DIR, paper_id=paper_id, top_k=10)
     if rows:
@@ -437,66 +89,68 @@ def _rag_context(paper_id: int, message: str) -> tuple[str, list[dict[str, Any]]
     return _paper_context(paper_id), []
 
 
-def _process_document(paper_id: int, document) -> None:
-    """Re-parse a document into pages/chunks/vectors and mark it ready."""
-    chunk_rows: list[dict[str, Any]] = []
-    total_chars = 0
-    _safe_delete_vectors(paper_id)
-    with get_connection() as connection:
-        # Delete chunks explicitly (not via cascade) so the FTS cleanup trigger fires.
-        connection.execute("DELETE FROM chunks WHERE paper_id=?", (paper_id,))
-        connection.execute("DELETE FROM pages WHERE paper_id=?", (paper_id,))
-        for page_number, page in enumerate(document, start=1):
-            full_text, chunks = _extract_page(page, page_number)
-            total_chars += len(full_text)
-            page_id = connection.execute(
-                "INSERT INTO pages(paper_id, page_number, text) VALUES (?, ?, ?)",
-                (paper_id, page_number, full_text),
-            ).lastrowid
-            for block in page.get_text("blocks"):
-                if len(block) >= 5 and str(block[4]).strip():
-                    connection.execute(
-                        "INSERT INTO page_text_blocks(page_id, x0, y0, x1, y1, text) VALUES (?, ?, ?, ?, ?, ?)",
-                        (page_id, *block[:4], str(block[4]).strip()),
-                    )
-            for chunk_index, chunk in enumerate(chunks):
-                cursor = connection.execute(
-                    "INSERT INTO chunks(paper_id, page_id, chunk_index, text, x0, y0, x1, y1, section, heading) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (paper_id, page_id, chunk_index, chunk["text"], chunk["x0"], chunk["y0"],
-                     chunk["x1"], chunk["y1"], chunk["section"], chunk["heading"]),
-                )
-                chunk_rows.append({
-                    "id": cursor.lastrowid, "paper_id": paper_id, "page_id": page_id,
-                    "page_number": page_number, "section": chunk["section"],
-                    "heading": chunk["heading"], "text": chunk["text"],
-                    "x0": chunk["x0"], "y0": chunk["y0"], "x1": chunk["x1"], "y1": chunk["y1"],
-                })
+# --- Background import jobs -----------------------------------------------------------
 
-    vectorized = 0
-    embedding_model = ""
-    embedding_dim: Optional[int] = None
-    if chunk_rows:
-        key = _safe_qwen_key()
-        if key:
-            try:
-                embedding_model = _embedding_model()
-                vectors = embed_texts([row["text"] for row in chunk_rows], key, embedding_model)
-                for row, vector in zip(chunk_rows, vectors):
-                    row["vector"] = normalize(vector)
-                upsert_chunks(VECTORS_DIR, chunk_rows)
-                embedding_dim = len(vectors[0]) if vectors else None
-                vectorized = 1
-            except Exception:
-                vectorized = 0  # embedding failure must not block reading/FTS
-
-    needs_ocr = 0 if total_chars else 1
+def _set_progress(paper_id: int, stage: str, current: int = 0, total: int = 0,
+                  status: Optional[str] = None, error: Optional[str] = None) -> None:
+    assignments = ["progress_stage=?", "progress_current=?", "progress_total=?"]
+    params: list[Any] = [stage, current, total]
+    if status is not None:
+        assignments.append("status=?")
+        params.append(status)
+    if error is not None:
+        assignments.append("error_message=?")
+        params.append(error)
+    params.append(paper_id)
     with get_connection() as connection:
-        connection.execute(
-            "UPDATE papers SET page_count=?, status='ready', vectorized=?, needs_ocr=?, "
-            "embedding_model=?, embedding_dim=? WHERE id=?",
-            (len(document), vectorized, needs_ocr, embedding_model, embedding_dim, paper_id),
-        )
+        connection.execute(f"UPDATE papers SET {', '.join(assignments)} WHERE id=?", params)
+        connection.commit()
+
+
+def _progress_callback(paper_id: int):
+    def report(stage: str, current: int, total: int) -> None:
+        try:
+            _set_progress(paper_id, stage, current, total)
+        except Exception:
+            LOGGER.warning("failed to persist progress for paper %s", paper_id, exc_info=True)
+    return report
+
+
+def _run_import_job(paper_id: int, stored_path: str) -> None:
+    try:
+        _set_progress(paper_id, "parsing", status="processing", error=None)
+        document = fitz.open(stored_path)
+        try:
+            if len(document) > MAX_PAGES:
+                raise ValueError("单个 PDF 不得超过 300 页")
+            process_document(
+                paper_id, document, DB_PATH, VECTORS_DIR,
+                embedding_key=_safe_qwen_key(), embedding_model=_embedding_model(),
+                progress=_progress_callback(paper_id),
+            )
+        finally:
+            document.close()
+    except Exception as error:
+        LOGGER.exception("import failed for paper %s", paper_id)
+        _set_progress(paper_id, "failed", status="failed", error=str(error))
+
+
+def _run_reindex_job(paper_id: int, key: str) -> None:
+    try:
+        _set_progress(paper_id, "queued")
+        reindex_document(paper_id, DB_PATH, VECTORS_DIR, key,
+                         embedding_model=_embedding_model(),
+                         progress=_progress_callback(paper_id))
+    except Exception as error:
+        LOGGER.exception("reindex failed for paper %s", paper_id)
+        # The extracted text and FTS index are still usable, so keep the paper
+        # readable and surface the failure through progress/error_message.
+        _set_progress(paper_id, "index_failed", error=str(error))
+
+
+def _enqueue_import(paper_id: int, stored_path: Path) -> None:
+    _set_progress(paper_id, "queued", status="processing", error=None)
+    _IMPORT_EXECUTOR.submit(_run_import_job, paper_id, str(stored_path))
 
 
 # --- Pydantic payloads ----------------------------------------------------------------
@@ -803,6 +457,11 @@ def startup() -> None:
     initialize_storage()
 
 
+@app.on_event("shutdown")
+def shutdown() -> None:
+    _IMPORT_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "storage": str(APP_HOME)}
@@ -812,7 +471,8 @@ def health() -> dict[str, str]:
 def list_papers() -> list[dict[str, Any]]:
     with get_connection() as connection:
         rows = connection.execute(
-            "SELECT id, title, file_name, page_count, status, error_message, imported_at, vectorized, needs_ocr "
+            "SELECT id, title, file_name, page_count, status, error_message, imported_at, vectorized, needs_ocr, "
+            "embedding_model, embedding_dim, progress_stage, progress_current, progress_total "
             "FROM papers ORDER BY imported_at DESC"
         ).fetchall()
     return [dict(row) for row in rows]
@@ -1044,6 +704,11 @@ def refresh_structured_paper(paper_id: int) -> dict[str, Any]:
 
 @app.post("/api/papers/import")
 async def import_paper(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Validate and persist the PDF, then parse/embed it on a background worker.
+
+    The response returns as soon as the file is durable; the client polls
+    ``/api/papers/{id}/status`` for progress.
+    """
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "仅支持 PDF 文件")
     content = await file.read()
@@ -1058,39 +723,77 @@ async def import_paper(file: UploadFile = File(...)) -> dict[str, Any]:
     safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", file.filename)
     stored_path = PAPERS_DIR / f"{digest[:16]}_{safe_name}"
     stored_path.write_bytes(content)
-    paper_id: Optional[int] = None
-    document: Optional[fitz.Document] = None
     try:
-        document = fitz.open(stored_path)
-        if len(document) > MAX_PAGES:
-            raise ValueError("单个 PDF 不得超过 300 页")
-        title = (document.metadata.get("title") or Path(file.filename).stem).strip() or "未命名论文"
+        with fitz.open(stored_path) as document:
+            if len(document) > MAX_PAGES:
+                raise ValueError("单个 PDF 不得超过 300 页")
+            title = (document.metadata.get("title") or Path(file.filename).stem).strip() or "未命名论文"
+            page_count = len(document)
+    except Exception as error:
+        stored_path.unlink(missing_ok=True)
+        raise HTTPException(422, f"解析 PDF 失败：{error}") from error
+
+    try:
         with get_connection() as connection:
             cursor = connection.execute(
                 "INSERT INTO papers(title, file_name, stored_path, sha256, page_count, status, imported_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (title, file.filename, str(stored_path), digest, len(document), "processing", utc_now()),
+                (title, file.filename, str(stored_path), digest, page_count, "processing", utc_now()),
             )
-            paper_id = cursor.lastrowid
+            paper_id = int(cursor.lastrowid)
             connection.execute(
                 "INSERT INTO paper_metadata(paper_id, authors, abstract, keywords) VALUES(?,?,?,?)",
                 (paper_id, "[]", "", "[]"),
             )
-        _process_document(paper_id, document)
-        return {"id": paper_id, "title": title, "status": "ready"}
-    except Exception as error:
-        if paper_id is not None:
-            with get_connection() as connection:
-                connection.execute(
-                    "UPDATE papers SET status = 'failed', error_message = ? WHERE id = ?",
-                    (str(error), paper_id),
-                )
-        if paper_id is None:
-            stored_path.unlink(missing_ok=True)
-        raise HTTPException(422, f"解析 PDF 失败：{error}") from error
-    finally:
-        if document is not None:
-            document.close()
+            connection.commit()
+    except Exception:
+        stored_path.unlink(missing_ok=True)
+        raise
+    _enqueue_import(paper_id, stored_path)
+    return {"id": paper_id, "title": title, "status": "processing", "page_count": page_count}
+
+
+@app.get("/api/papers/{paper_id}/status")
+def paper_status(paper_id: int) -> dict[str, Any]:
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT id, status, error_message, page_count, vectorized, needs_ocr, embedding_model, "
+            "embedding_dim, progress_stage, progress_current, progress_total FROM papers WHERE id=?",
+            (paper_id,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(404, "论文不存在")
+    result = dict(row)
+    total = int(result.get("progress_total") or 0)
+    current = int(result.get("progress_current") or 0)
+    result["progress_ratio"] = round(current / total, 3) if total > 0 else 0.0
+    return result
+
+
+@app.post("/api/papers/{paper_id}/reindex")
+def reindex_paper(paper_id: int) -> dict[str, Any]:
+    """Re-embed existing chunks, e.g. after switching the embedding model."""
+    key = _safe_qwen_key()
+    if not key:
+        raise HTTPException(400, "请先在设置中配置 Qwen（DashScope）嵌入 Key")
+    with get_connection() as connection:
+        paper = connection.execute(
+            "SELECT status, (SELECT COUNT(*) FROM chunks WHERE paper_id=?) AS chunks "
+            "FROM papers WHERE id=?",
+            (paper_id, paper_id),
+        ).fetchone()
+    if paper is None:
+        raise HTTPException(404, "论文不存在")
+    if paper["status"] == "processing":
+        raise HTTPException(409, "论文仍在导入中")
+    if int(paper["chunks"] or 0) == 0:
+        raise HTTPException(409, "论文没有可重建索引的切片，请先重试解析")
+    _set_progress(paper_id, "queued", error=None)
+    with get_connection() as connection:
+        connection.execute("UPDATE papers SET error_message=NULL WHERE id=?", (paper_id,))
+        connection.commit()
+    _IMPORT_EXECUTOR.submit(_run_reindex_job, paper_id, key)
+    return {"id": paper_id, "status": "processing", "chunks": int(paper["chunks"] or 0)}
 
 
 @app.delete("/api/papers/{paper_id}")
@@ -1386,19 +1089,15 @@ def general_chat_history() -> list[dict[str, Any]]:
 @app.post("/api/papers/{paper_id}/retry")
 def retry_paper(paper_id: int) -> dict[str, Any]:
     with get_connection() as connection:
-        paper = connection.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
-        if not paper:
-            raise HTTPException(404, "论文不存在")
-        path = Path(paper["stored_path"])
-        connection.execute("UPDATE papers SET status='processing', error_message=NULL WHERE id=?", (paper_id,))
-    try:
-        document = fitz.open(path)
-        try:
-            _process_document(paper_id, document)
-        finally:
-            document.close()
-        return {"id": paper_id, "status": "ready"}
-    except Exception as error:
-        with get_connection() as connection:
-            connection.execute("UPDATE papers SET status='failed',error_message=? WHERE id=?", (str(error), paper_id))
-        raise HTTPException(422, f"重试解析失败：{error}") from error
+        paper = connection.execute(
+            "SELECT stored_path, status FROM papers WHERE id=?", (paper_id,)
+        ).fetchone()
+    if not paper:
+        raise HTTPException(404, "论文不存在")
+    if paper["status"] == "processing":
+        raise HTTPException(409, "论文正在处理中")
+    path = Path(paper["stored_path"])
+    if not path.is_file():
+        raise HTTPException(410, "原始 PDF 已丢失，请重新导入")
+    _enqueue_import(paper_id, path)
+    return {"id": paper_id, "status": "processing"}

@@ -11,7 +11,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from backend import agent, citations, retrieval, safety, structured  # noqa: E402
+from backend import agent, citations, medical_terms, retrieval, safety, structured  # noqa: E402
 
 
 SCHEMA = """
@@ -67,6 +67,7 @@ class AgenticRagTestCase(unittest.TestCase):
                 (1, 1, 1, 0, "The primary outcome was all-cause mortality at 12 months.", "Results", "Results"),
                 (2, 1, 1, 1, "The trial enrolled 1200 patients with heart failure.", "Methods", "Methods"),
                 (3, 1, 1, 2, "心力衰竭患者接受标准治疗后随访一年。", "结果", "结果"),
+                (4, 1, 1, 3, "MI was defined as myocardial infarction on admission.", "Methods", "Methods"),
             ],
         )
         connection.commit()
@@ -80,6 +81,22 @@ class AgenticRagTestCase(unittest.TestCase):
         self.assertTrue(any("primary outcome" in row["text"].lower() for row in english))
         chinese = retrieval.keyword_search("心力衰竭", self.db)
         self.assertTrue(any("心力衰竭" in row["text"] for row in chinese))
+
+    def test_bilingual_expansion_finds_cross_language_chunks(self) -> None:
+        self.assertIn("heart failure", medical_terms.expand_query("心衰"))
+        self.assertIn("myocardial infarction", medical_terms.expand_query("MI"))
+        # "or" in a normal English sentence must not expand to odds ratio.
+        self.assertNotIn("odds ratio", medical_terms.expand_query("primary outcome"))
+        chinese_hits = retrieval.keyword_search("心衰", self.db)
+        self.assertTrue(any("heart failure" in row["text"].lower() for row in chinese_hits))
+        abbreviation_hits = retrieval.keyword_search("MI", self.db)
+        self.assertTrue(any("myocardial infarction" in row["text"].lower() for row in abbreviation_hits))
+
+    def test_chinese_section_heading_detection(self) -> None:
+        from backend import app as app_module
+        self.assertTrue(app_module._is_heading({"text": "方法", "size": 10, "bold_ratio": 0.0}, 10.0))
+        self.assertTrue(app_module._is_heading({"text": "结果", "size": 10, "bold_ratio": 0.0}, 10.0))
+        self.assertFalse(app_module._is_heading({"text": "这是一段正文内容", "size": 10, "bold_ratio": 0.0}, 10.0))
 
     def test_rrf_fuses_both_sources(self) -> None:
         fake_vector = [{

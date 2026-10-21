@@ -18,6 +18,7 @@ from typing import Any, Iterable, Optional
 
 from .credentials import safe_key
 from .embedding import DEFAULT_EMBED_MODEL, embed_texts, normalize, search_chunks
+from .medical_terms import expand_query
 
 RRF_K = 60
 CJK_RE = re.compile(r"[㐀-鿿]")
@@ -40,68 +41,104 @@ def _like(term: str) -> str:
     return "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 
-def _fts_query(query: str) -> str:
-    tokens = TOKEN_RE.findall(query)
-    if not tokens:
-        return ""
-    return " OR ".join(f'"{token}"' for token in tokens[:12])
+def _dedupe(values: Iterable[str], limit: int = 24) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        value = value.strip()
+        key = value.lower()
+        if not value or key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _fts_rows(connection: sqlite3.Connection, fts_query: str,
+              paper_id: Optional[int], limit: int) -> list[sqlite3.Row]:
+    clause = "AND c.paper_id = ?" if paper_id is not None else ""
+    params: list[Any] = [fts_query]
+    if paper_id is not None:
+        params.append(paper_id)
+    try:
+        return connection.execute(
+            "SELECT c.id, c.paper_id, c.page_id, c.chunk_index, c.text, c.section, c.heading, "
+            "c.x0, c.y0, c.x1, c.y1, p.page_number, papers.title AS paper_title "
+            "FROM chunks_fts JOIN chunks c ON chunks_fts.rowid = c.id "
+            "JOIN pages p ON p.id = c.page_id JOIN papers ON papers.id = c.paper_id "
+            f"WHERE chunks_fts MATCH ? {clause} "
+            "ORDER BY p.page_number, c.chunk_index LIMIT ?",
+            [*params, limit],
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
+def _like_rows(connection: sqlite3.Connection, terms: list[str],
+               paper_id: Optional[int], limit: int) -> list[sqlite3.Row]:
+    if not terms:
+        return []
+    like_clause = " OR ".join(["c.text LIKE ? ESCAPE '\\'"] * len(terms))
+    where = f"({like_clause})"
+    params: list[Any] = [_like(term) for term in terms]
+    if paper_id is not None:
+        where += " AND c.paper_id = ?"
+        params.append(paper_id)
+    return connection.execute(
+        "SELECT c.id, c.paper_id, c.page_id, c.chunk_index, c.text, c.section, c.heading, "
+        "c.x0, c.y0, c.x1, c.y1, p.page_number, papers.title AS paper_title "
+        "FROM chunks c JOIN pages p ON p.id = c.page_id JOIN papers ON papers.id = c.paper_id "
+        f"WHERE {where} ORDER BY p.page_number, c.chunk_index LIMIT ?",
+        [*params, limit],
+    ).fetchall()
 
 
 def keyword_search(query: str, db_path: Path | str, paper_id: Optional[int] = None,
                    limit: int = 30) -> list[dict[str, Any]]:
-    """Literal search with a CJK-friendly LIKE fallback.
+    """Literal search with bilingual expansion and a CJK-friendly LIKE path.
 
     SQLite's unicode61 tokenizer treats a run of Chinese characters as one
-    token, so FTS5 alone misses most Chinese queries.  For CJK we use LIKE on
-    the whole phrase and on short terms; for English we use FTS5 with OR for
-    better recall.
+    token, so FTS5 alone misses most Chinese queries.  English terms go through
+    FTS5; Chinese terms and their synonyms go through LIKE.  Results from both
+    paths are merged, which lets "心衰" find an English paper that says "heart
+    failure" and vice versa.
     """
     query = query.strip()
     if not query:
         return []
+    expansions = expand_query(query)
+    all_terms = [query, *expansions]
+    fts_tokens = _dedupe(TOKEN_RE.findall(" ".join(all_terms)))
+    fts_query = " OR ".join(f'"{token}"' for token in fts_tokens) if fts_tokens else ""
+
+    like_terms: list[str] = []
+    if _has_cjk(query):
+        pieces = [piece for piece in TERM_SPLIT_RE.split(query) if len(piece) >= 2]
+        like_terms.extend(pieces or [query])
+    like_terms.extend(term for term in all_terms if _has_cjk(term))
+    like_terms = _dedupe(like_terms, limit=12)
+
     connection = connect(db_path)
     try:
-        rows: list[sqlite3.Row] = []
-        fts_query = _fts_query(query)
-        if fts_query and not _has_cjk(query):
-            clause = "AND c.paper_id = ?" if paper_id is not None else ""
-            params: list[Any] = [fts_query]
-            if paper_id is not None:
-                params.insert(0, paper_id)
-            try:
-                rows = connection.execute(
-                    "SELECT c.id, c.paper_id, c.page_id, c.chunk_index, c.text, c.section, c.heading, "
-                    "c.x0, c.y0, c.x1, c.y1, p.page_number, papers.title AS paper_title "
-                    "FROM chunks_fts JOIN chunks c ON chunks_fts.rowid = c.id "
-                    "JOIN pages p ON p.id = c.page_id JOIN papers ON papers.id = c.paper_id "
-                    f"WHERE chunks_fts MATCH ? {clause} "
-                    "ORDER BY p.page_number, c.chunk_index LIMIT ?",
-                    [*params, limit],
-                ).fetchall()
-            except sqlite3.OperationalError:
-                rows = []
-
-        if not rows:
-            terms = [query]
-            if _has_cjk(query):
-                pieces = [piece for piece in TERM_SPLIT_RE.split(query) if len(piece) >= 2]
-                terms = pieces[:6] or [query]
-            like_clause = " OR ".join(["c.text LIKE ? ESCAPE '\\'"] * len(terms))
-            where = f"({like_clause})"
-            params = [_like(term) for term in terms]
-            if paper_id is not None:
-                where += " AND c.paper_id = ?"
-                params.append(paper_id)
-            rows = connection.execute(
-                "SELECT c.id, c.paper_id, c.page_id, c.chunk_index, c.text, c.section, c.heading, "
-                "c.x0, c.y0, c.x1, c.y1, p.page_number, papers.title AS paper_title "
-                "FROM chunks c JOIN pages p ON p.id = c.page_id JOIN papers ON papers.id = c.paper_id "
-                f"WHERE {where} ORDER BY p.page_number, c.chunk_index LIMIT ?",
-                [*params, limit],
-            ).fetchall()
-        return [_row_to_chunk(row, source="keyword") for row in rows]
+        fts_rows = _fts_rows(connection, fts_query, paper_id, limit) if fts_query else []
+        like_rows = _like_rows(connection, like_terms, paper_id, limit) if like_terms else []
     finally:
         connection.close()
+
+    ordered = (like_rows + fts_rows) if _has_cjk(query) else (fts_rows + like_rows)
+    results: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for row in ordered:
+        chunk_id = int(row["id"])
+        if chunk_id in seen:
+            continue
+        seen.add(chunk_id)
+        results.append(_row_to_chunk(row, source="keyword"))
+        if len(results) >= limit:
+            break
+    return results
 
 
 def vector_search(query: str, db_path: Path | str, vectors_dir: Path | str,

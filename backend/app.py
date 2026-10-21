@@ -53,6 +53,10 @@ HEADING_RE = re.compile(
     r"interventions?|comparators?|ethics|funding|conflicts?\s+of\s+interest)\b",
     re.IGNORECASE,
 )
+CHINESE_HEADING_RE = re.compile(
+    r"^(?:摘要|引言|背景|方法|材料与方法|结果|讨论|结论|参考文献|局限性|"
+    r"研究设计|统计分析|研究对象|干预措施|对照组|结局指标|伦理|资助|利益冲突)"
+)
 NUMBERED_RE = re.compile(r"^\d+(?:\.\d+)*\.?\s+\S")
 
 
@@ -316,7 +320,7 @@ def _is_heading(el: dict[str, Any], body_size: float) -> bool:
     text = el["text"].strip()
     if not text or len(text) > 150:
         return False
-    if NUMBERED_RE.match(text) or HEADING_RE.match(text):
+    if NUMBERED_RE.match(text) or HEADING_RE.match(text) or CHINESE_HEADING_RE.match(text):
         return True
     if body_size and el["size"] >= body_size + 0.8 and el["bold_ratio"] >= 0.5:
         return True

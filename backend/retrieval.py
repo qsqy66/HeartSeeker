@@ -24,6 +24,13 @@ RRF_K = 60
 CJK_RE = re.compile(r"[㐀-鿿]")
 TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]+|\d+(?:\.\d+)?")
 TERM_SPLIT_RE = re.compile(r"[\s,;，；。！？、/|()（）\[\]【】]+")
+# Chinese questions have no word delimiters.  Removing common interrogative and
+# function phrases yields useful LIKE terms ("主要结局是什么" -> "主要结局"),
+# and bigrams provide a fallback when the phrase is longer.
+CJK_STOP_RE = re.compile(
+    r"(?:是什么|什么|是多少|多少|哪些|哪个|如何|怎么|为什么|是否|有没有|"
+    r"患者|病人|研究|试验|论文|文章|请问|告诉|一下)"
+)
 
 
 def connect(db_path: Path | str) -> sqlite3.Connection:
@@ -39,6 +46,20 @@ def _has_cjk(text: str) -> bool:
 
 def _like(term: str) -> str:
     return "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def _cjk_like_terms(query: str, limit: int = 24) -> list[str]:
+    """Split a Chinese question into searchable phrases and short n-grams."""
+    terms: list[str] = []
+    for piece in TERM_SPLIT_RE.split(query):
+        for sub in CJK_STOP_RE.split(piece):
+            sub = sub.strip().lstrip("的了")
+            if len(sub) < 2:
+                continue
+            terms.append(sub)
+            if len(sub) <= 8:
+                terms.extend(sub[index:index + 2] for index in range(len(sub) - 1))
+    return _dedupe(terms, limit=limit)
 
 
 def _dedupe(values: Iterable[str], limit: int = 24) -> list[str]:
@@ -69,7 +90,7 @@ def _fts_rows(connection: sqlite3.Connection, fts_query: str,
             "FROM chunks_fts JOIN chunks c ON chunks_fts.rowid = c.id "
             "JOIN pages p ON p.id = c.page_id JOIN papers ON papers.id = c.paper_id "
             f"WHERE chunks_fts MATCH ? {clause} "
-            "ORDER BY p.page_number, c.chunk_index LIMIT ?",
+            "ORDER BY bm25(chunks_fts), p.page_number, c.chunk_index LIMIT ?",
             [*params, limit],
         ).fetchall()
     except sqlite3.OperationalError:
@@ -115,10 +136,9 @@ def keyword_search(query: str, db_path: Path | str, paper_id: Optional[int] = No
 
     like_terms: list[str] = []
     if _has_cjk(query):
-        pieces = [piece for piece in TERM_SPLIT_RE.split(query) if len(piece) >= 2]
-        like_terms.extend(pieces or [query])
+        like_terms.extend(_cjk_like_terms(query))
     like_terms.extend(term for term in all_terms if _has_cjk(term))
-    like_terms = _dedupe(like_terms, limit=12)
+    like_terms = _dedupe(like_terms, limit=24)
 
     connection = connect(db_path)
     try:

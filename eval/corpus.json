@@ -1,0 +1,134 @@
+{
+  "description": "Deterministic bilingual fixture for offline retrieval and citation evaluation. Not clinical evidence.",
+  "papers": [
+    {
+      "id": 1,
+      "title": "Dapagliflozin in Heart Failure with Reduced Ejection Fraction",
+      "file_name": "dapagliflozin-hf.pdf",
+      "pages": [
+        {
+          "page_number": 1,
+          "text": "Abstract\nHeart failure is a major cause of morbidity. The primary outcome was a composite of worsening heart failure or cardiovascular death. Dapagliflozin may improve outcomes in patients with reduced ejection fraction."
+        },
+        {
+          "page_number": 2,
+          "text": "Methods\nWe randomly assigned 4744 patients with heart failure and a reduced ejection fraction to receive dapagliflozin 10 mg once daily or placebo. The trial was double-blind and event-driven."
+        },
+        {
+          "page_number": 3,
+          "text": "Results\nThe primary outcome occurred in 386 of 2373 patients (16.3%) in the dapagliflozin group and 502 of 2371 (21.2%) in the placebo group (hazard ratio, 0.74; 95% CI, 0.65 to 0.85; P<0.001)."
+        }
+      ],
+      "chunks": [
+        {
+          "page_number": 1,
+          "section": "Abstract",
+          "heading": "Abstract",
+          "text": "The primary outcome was a composite of worsening heart failure or cardiovascular death."
+        },
+        {
+          "page_number": 1,
+          "section": "Abstract",
+          "heading": "Abstract",
+          "text": "Dapagliflozin may improve outcomes in patients with reduced ejection fraction."
+        },
+        {
+          "page_number": 2,
+          "section": "Methods",
+          "heading": "Methods",
+          "text": "We randomly assigned 4744 patients with heart failure and a reduced ejection fraction to receive dapagliflozin 10 mg once daily or placebo."
+        },
+        {
+          "page_number": 2,
+          "section": "Methods",
+          "heading": "Methods",
+          "text": "The trial was double-blind and event-driven."
+        },
+        {
+          "page_number": 3,
+          "section": "Results",
+          "heading": "Results",
+          "text": "The primary outcome occurred in 386 of 2373 patients (16.3%) in the dapagliflozin group and 502 of 2371 (21.2%) in the placebo group (hazard ratio, 0.74; 95% CI, 0.65 to 0.85; P<0.001)."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "心力衰竭患者运动康复的随机对照试验",
+      "file_name": "exercise-hf.pdf",
+      "pages": [
+        {
+          "page_number": 1,
+          "text": "摘要\n本研究评估运动康复对心力衰竭患者预后的影响。主要结局是心血管死亡或心力衰竭住院的复合终点。"
+        },
+        {
+          "page_number": 2,
+          "text": "方法\n共纳入 120 名心力衰竭患者，随机分为运动康复组和常规护理组，随访 12 个月。"
+        },
+        {
+          "page_number": 3,
+          "text": "结果\n运动康复组的主要结局发生率为 18.3%，常规护理组为 29.8%（风险比 0.61，95% 置信区间 0.42 至 0.89）。"
+        }
+      ],
+      "chunks": [
+        {
+          "page_number": 1,
+          "section": "摘要",
+          "heading": "摘要",
+          "text": "本研究评估运动康复对心力衰竭患者预后的影响。主要结局是心血管死亡或心力衰竭住院的复合终点。"
+        },
+        {
+          "page_number": 2,
+          "section": "方法",
+          "heading": "方法",
+          "text": "共纳入 120 名心力衰竭患者，随机分为运动康复组和常规护理组，随访 12 个月。"
+        },
+        {
+          "page_number": 3,
+          "section": "结果",
+          "heading": "结果",
+          "text": "运动康复组的主要结局发生率为 18.3%，常规护理组为 29.8%（风险比 0.61，95% 置信区间 0.42 至 0.89）。"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Metformin and Cardiovascular Outcomes in Type 2 Diabetes",
+      "file_name": "metformin-cv.pdf",
+      "pages": [
+        {
+          "page_number": 1,
+          "text": "Abstract\nMetformin is widely used in type 2 diabetes, but its effect on cardiovascular outcomes remains uncertain. We therefore conducted a randomized placebo-controlled trial."
+        },
+        {
+          "page_number": 2,
+          "text": "Methods\nWe randomly assigned 2000 adults with type 2 diabetes to metformin or placebo and followed them for a median of 4.5 years."
+        },
+        {
+          "page_number": 3,
+          "text": "Results\nMetformin did not significantly reduce the primary composite cardiovascular outcome (hazard ratio 0.92; 95% CI 0.78 to 1.09)."
+        }
+      ],
+      "chunks": [
+        {
+          "page_number": 1,
+          "section": "Abstract",
+          "heading": "Abstract",
+          "text": "Metformin is widely used in type 2 diabetes, but its effect on cardiovascular outcomes remains uncertain."
+        },
+        {
+          "page_number": 2,
+          "section": "Methods",
+          "heading": "Methods",
+          "text": "We randomly assigned 2000 adults with type 2 diabetes to metformin or placebo and followed them for a median of 4.5 years."
+        },
+        {
+          "page_number": 3,
+          "section": "Results",
+          "heading": "Results",
+          "text": "Metformin did not significantly reduce the primary composite cardiovascular outcome (hazard ratio 0.92; 95% CI 0.78 to 1.09)."
+        }
+      ]
+    }
+  ]
+}

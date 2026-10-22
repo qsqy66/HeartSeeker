@@ -1,0 +1,71 @@
+{
+  "description": "Golden questions over eval/corpus.json. expected_pages are 1-indexed PDF pages; quote must occur verbatim on quote_page.",
+  "cases": [
+    {
+      "id": "dapa-primary-outcome",
+      "question": "What was the primary outcome of the dapagliflozin trial?",
+      "paper_id": 1,
+      "expected_pages": [1],
+      "quote": "The primary outcome was a composite of worsening heart failure or cardiovascular death.",
+      "quote_page": 1
+    },
+    {
+      "id": "dapa-sample-size",
+      "question": "How many patients were randomly assigned and what dose was used?",
+      "paper_id": 1,
+      "expected_pages": [2],
+      "quote": "We randomly assigned 4744 patients with heart failure and a reduced ejection fraction to receive dapagliflozin 10 mg once daily or placebo.",
+      "quote_page": 2
+    },
+    {
+      "id": "dapa-hazard-ratio",
+      "question": "What was the hazard ratio for the primary outcome?",
+      "paper_id": 1,
+      "expected_pages": [3],
+      "quote": "hazard ratio, 0.74; 95% CI, 0.65 to 0.85",
+      "quote_page": 3
+    },
+    {
+      "id": "exercise-hf-outcome",
+      "question": "运动康复对心力衰竭患者的主要结局是什么？",
+      "paper_id": 2,
+      "expected_pages": [1],
+      "quote": "主要结局是心血管死亡或心力衰竭住院的复合终点。",
+      "quote_page": 1
+    },
+    {
+      "id": "exercise-hf-sample",
+      "question": "研究纳入了多少名心力衰竭患者？",
+      "paper_id": 2,
+      "expected_pages": [2],
+      "quote": "共纳入 120 名心力衰竭患者",
+      "quote_page": 2
+    },
+    {
+      "id": "metformin-cv-result",
+      "question": "Did metformin reduce cardiovascular events?",
+      "paper_id": 3,
+      "expected_pages": [3],
+      "quote": "Metformin did not significantly reduce the primary composite cardiovascular outcome (hazard ratio 0.92; 95% CI 0.78 to 1.09).",
+      "quote_page": 3
+    },
+    {
+      "id": "library-sglt2-hf",
+      "question": "dapagliflozin heart failure primary outcome",
+      "scope": "library",
+      "paper_id": 1,
+      "expected_pages": [1],
+      "quote": "The primary outcome was a composite of worsening heart failure or cardiovascular death.",
+      "quote_page": 1
+    },
+    {
+      "id": "library-chinese-exercise",
+      "question": "运动康复 心力衰竭 主要结局",
+      "scope": "library",
+      "paper_id": 2,
+      "expected_pages": [1],
+      "quote": "本研究评估运动康复对心力衰竭患者预后的影响。",
+      "quote_page": 1
+    }
+  ]
+}

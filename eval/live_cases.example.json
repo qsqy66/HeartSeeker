@@ -1,0 +1,13 @@
+{
+  "description": "Copy this file, replace the example with questions about your own library, then run scripts/evaluate.py --db ... --dataset this-file. expected_pages are 1-indexed PDF pages; quote must be copied verbatim from quote_page.",
+  "cases": [
+    {
+      "id": "example-question",
+      "paper_title": "替换为论文标题中的一段唯一文字",
+      "question": "这项研究的主要终点是什么？",
+      "expected_pages": [1],
+      "quote": "从第 1 页逐字复制的原文句子",
+      "quote_page": 1
+    }
+  ]
+}

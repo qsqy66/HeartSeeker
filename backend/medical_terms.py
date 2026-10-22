@@ -54,7 +54,6 @@ def expand_query(query: str) -> list[str]:
     query = (query or "").strip()
     if not query:
         return []
-    original = query.lower()
     extras: list[str] = []
     upper_tokens = set(_ASCII_WORD_RE.findall(query.upper()))
     for key, values in SYNONYMS.items():
@@ -67,7 +66,11 @@ def expand_query(query: str) -> list[str]:
             matched = bool(re.search(rf"\b{re.escape(key)}\b", query, re.IGNORECASE))
         if not matched:
             continue
-        for value in values:
-            if value.lower() not in original and value not in extras:
+        # A Chinese phrase has no whitespace delimiters, so the whole question is
+        # one long LIKE term.  Add the matched key itself as a standalone term:
+        # "运动康复对心力衰竭患者..." then still searches "心力衰竭".
+        candidates = ([key, *values] if _CJK_RE.search(key) else values)
+        for value in candidates:
+            if value not in extras:
                 extras.append(value)
     return extras

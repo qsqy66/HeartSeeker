@@ -13,12 +13,17 @@ class CredentialError(RuntimeError):
 def key_store(provider: str, value: Optional[str] = None) -> Optional[str]:
     """Read or write a provider key in keyring.
 
+    Keys are namespaced by the provider/key source.  Chat providers use their
+    preset id; semantic embeddings use ``qwen`` (DashScope) even when the chat
+    provider is someone else, so switching chat vendors never sends a foreign
+    key to the embedding endpoint.
+
     ``keyring`` is imported lazily so importing the backend never fails on a
     headless machine; only an explicit key operation reports the problem.
     """
     provider = provider.lower().strip()
     if provider not in PROVIDERS:
-        raise CredentialError("仅支持 deepseek 或 qwen")
+        raise CredentialError("未知的模型供应商")
     try:
         import keyring  # type: ignore
         if value is None:

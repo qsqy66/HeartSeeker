@@ -4,8 +4,6 @@ import hashlib
 import json
 import logging
 import re
-import urllib.error
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
@@ -18,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from .agent import AgentConfig, AgentError, AgentRunner
-from .credentials import safe_key
+from .credentials import CredentialError, key_store as _credential_key_store, safe_key
 from .embedding import DEFAULT_EMBED_MODEL, delete_paper_vectors
 from .ingestion import (
     is_heading as _is_heading,
@@ -27,14 +25,12 @@ from .ingestion import (
 )
 from .safety import MEDICAL_SYSTEM_RULES, apply_safety, wrap_untrusted
 from .storage import APP_HOME, DB_PATH, PAPERS_DIR, VECTORS_DIR, get_connection, initialize_storage, utc_now
-from . import retrieval
+from . import providers, retrieval
 from .structured import extract_fields
 
 
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_PAGES = 300
-PROVIDERS = {"deepseek": "https://api.deepseek.com/chat/completions", "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"}
-MODEL_ENDPOINTS = {"deepseek": "https://api.deepseek.com/models", "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1/models"}
 RECENT_TURNS = 10  # 最近 10 轮对话原文保留，更早的历史压缩为摘要
 LOGGER = logging.getLogger("paper_reader.ingestion")
 
@@ -198,22 +194,19 @@ class AgentChatPayload(BaseModel):
 class ModelsPayload(BaseModel):
     provider: str
     api_key: Optional[str] = None
+    protocol: Optional[str] = None
+    base_url: Optional[str] = None
 
 
 def _key_store(provider: str, value: Optional[str] = None) -> Optional[str]:
     """Store API keys in the operating system credential manager."""
-    provider = provider.lower().strip()
-    if provider not in PROVIDERS:
-        raise HTTPException(400, "仅支持 deepseek 或 qwen")
     try:
-        import keyring  # type: ignore
-        if value is None:
-            return keyring.get_password("paper-reader", provider)
-        else:
-            keyring.set_password("paper-reader", provider, value)
-            return value
-    except Exception as error:
-        raise HTTPException(503, "系统安全凭据库不可用，请安装并启用 keyring 后再配置 API Key") from error
+        provider = provider.lower().strip()
+        if provider not in providers.PROVIDERS:
+            raise HTTPException(400, "未知的模型供应商")
+        return _credential_key_store(provider, value)
+    except CredentialError as error:
+        raise HTTPException(503, str(error)) from error
 
 
 def _paper_context(paper_id: int) -> str:
@@ -239,70 +232,66 @@ def _grounded_response(message: str, answer: str, context: str) -> str:
     return answer.strip()
 
 
-def _provider_chat(provider: str, key: str, prompt: str, model: str) -> str:
-    payload = json.dumps({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1,
-    }).encode()
-    request = urllib.request.Request(PROVIDERS[provider], data=payload, headers={
-        "Authorization": f"Bearer {key}", "Content-Type": "application/json"
-    })
+def _setting(key: str, default: str = "") -> str:
+    with get_connection() as connection:
+        row = connection.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    value = row["value"].strip() if row and row["value"] else ""
+    return value or default
+
+
+def _provider_config(provider: Optional[str] = None) -> providers.ProviderConfig:
+    """Resolve the selected provider, including custom protocol/base URL."""
+    saved = (_setting("provider") or "deepseek").lower().strip()
+    selected = (provider or saved).lower().strip()
+    same_as_saved = selected == saved
+    protocol = (_setting("protocol") or None) if same_as_saved else None
+    base_url = (_setting("base_url") or None) if same_as_saved else None
     try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"]
-    except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError) as error:
-        raise HTTPException(502, f"{provider} 服务暂不可用") from error
+        return providers.resolve_config(selected, protocol=protocol, base_url=base_url)
+    except providers.ProviderError as error:
+        raise HTTPException(400, str(error)) from error
+
+
+def _provider_chat(provider: str, key: str, prompt: str, model: str) -> str:
+    config = _provider_config(provider)
+    try:
+        return providers.chat(config, key, model, [{"role": "user", "content": prompt}],
+                              timeout=45)
+    except providers.ProviderError as error:
+        raise HTTPException(502, str(error)) from error
 
 
 def _stream_provider_chat(provider: str, key: str, prompt: str, model: str):
-    """Yield text deltas from an OpenAI-compatible streaming chat completion."""
-    payload = json.dumps({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1,
-        "stream": True,
-    }).encode()
-    request = urllib.request.Request(PROVIDERS[provider], data=payload, headers={
-        "Authorization": f"Bearer {key}", "Content-Type": "application/json"
-    })
+    config = _provider_config(provider)
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            for raw_line in response:
-                line = raw_line.decode("utf-8").strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                choices = chunk.get("choices") or []
-                if not choices:
-                    continue
-                piece = (choices[0].get("delta") or {}).get("content")
-                if piece:
-                    yield piece
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-        raise HTTPException(502, f"{provider} 服务暂不可用") from error
+        yield from providers.stream(config, key, model, [{"role": "user", "content": prompt}],
+                                     timeout=120)
+    except providers.ProviderError as error:
+        raise HTTPException(502, str(error)) from error
 
 
-def _default_provider() -> str:
-    with get_connection() as connection:
-        row = connection.execute("SELECT value FROM settings WHERE key='provider'").fetchone()
-    provider = (row["value"].strip() if row and row["value"].strip() else "deepseek")
-    return provider if provider in PROVIDERS else "deepseek"
+def _resolve_model(provider: str | providers.ProviderConfig) -> str:
+    config = provider if isinstance(provider, providers.ProviderConfig) else _provider_config(provider)
+    saved = (_setting("provider") or "deepseek").lower().strip()
+    model = _setting("model") if config.id == saved else ""
+    return model or config.default_model
 
 
-def _resolve_model(provider: str) -> str:
-    with get_connection() as connection:
-        setting = connection.execute("SELECT value FROM settings WHERE key='model'").fetchone()
-    return setting["value"].strip() if setting and setting["value"].strip() else (
-        "deepseek-chat" if provider == "deepseek" else "qwen-plus"
-    )
+def _chat_target(provider: Optional[str] = None) -> tuple[providers.ProviderConfig, str, str]:
+    """Resolve provider, credential and model, with consistent 400 messages."""
+    config = _provider_config(provider)
+    key = ""
+    try:
+        key = _key_store(config.id) or ""
+    except HTTPException:
+        if config.requires_key:
+            raise
+    if config.requires_key and not key:
+        raise HTTPException(400, f"{config.label} 尚未配置 API Key，请先在设置中填写")
+    model = _resolve_model(config)
+    if not model:
+        raise HTTPException(400, "请先在设置中填写模型名称")
+    return config, key, model
 
 
 def _format_turns(messages: list[dict[str, Any]]) -> str:
@@ -537,13 +526,8 @@ def agent_chat(payload: AgentChatPayload):
     message = (payload.message or payload.question).strip()
     if not message:
         raise HTTPException(400, "问题不能为空")
-    provider = (payload.provider or _default_provider()).lower()
-    if provider not in PROVIDERS:
-        raise HTTPException(400, "provider 必须是 deepseek 或 qwen")
-    key = _key_store(provider)
-    if not key:
-        raise HTTPException(400, f"{provider} 尚未配置 API key")
-    model = _resolve_model(provider)
+    endpoint, key, model = _chat_target(payload.provider)
+    provider = endpoint.id
 
     mode = (payload.mode or "auto").lower().strip()
     if mode not in {"auto", "paper", "library", "general"}:
@@ -565,9 +549,10 @@ def agent_chat(payload: AgentChatPayload):
         mode = "paper"
 
     history = _agent_history(mode, paper_id, payload.retry, message)
-    config = AgentConfig(provider=provider, key=key, model=model, mode=mode,
-                         paper_id=paper_id, history=history)
-    runner = AgentRunner(config, DB_PATH, VECTORS_DIR)
+    agent_config = AgentConfig(provider=provider, key=key, model=model, mode=mode,
+                               protocol=endpoint.protocol, base_url=endpoint.base_url,
+                               paper_id=paper_id, history=history)
+    runner = AgentRunner(agent_config, DB_PATH, VECTORS_DIR)
 
     if not payload.stream:
         try:
@@ -667,14 +652,16 @@ def get_paper(paper_id: int) -> dict[str, Any]:
 
 def _structured_analysis(paper_id: int, force_llm: bool) -> dict[str, Any]:
     _paper_context(paper_id)
-    provider = _default_provider()
+    endpoint = _provider_config()
+    provider = endpoint.id
     key = safe_key(provider) or ""
-    model = _resolve_model(provider)
+    model = _resolve_model(endpoint)
     analysis = extract_fields(paper_id, DB_PATH, provider, key, model,
-                              force=force_llm, use_llm=bool(key) and force_llm)
+                              force=force_llm, use_llm=force_llm,
+                              protocol=endpoint.protocol, base_url=endpoint.base_url)
     analysis["provider"] = provider
     analysis["model"] = model
-    analysis["llm_available"] = bool(key)
+    analysis["llm_available"] = bool(key) or not endpoint.requires_key
     return analysis
 
 
@@ -693,9 +680,11 @@ def structured_paper(paper_id: int, refresh: bool = False) -> dict[str, Any]:
 
 @app.post("/api/papers/{paper_id}/structured")
 def refresh_structured_paper(paper_id: int) -> dict[str, Any]:
-    provider = _default_provider()
-    if not safe_key(provider):
+    endpoint = _provider_config()
+    if endpoint.requires_key and not safe_key(endpoint.id):
         raise HTTPException(400, "请先在设置中配置问答模型 API Key")
+    if not _resolve_model(endpoint):
+        raise HTTPException(400, "请先在设置中填写模型名称")
     try:
         return _structured_analysis(paper_id, force_llm=True)
     except ValueError as error:
@@ -857,86 +846,134 @@ def paper_file(paper_id: int):
     return FileResponse(paper["stored_path"], media_type="application/pdf", filename=paper["file_name"])
 
 
-@app.get("/api/settings")
-def get_settings() -> dict[str, Any]:
-    with get_connection() as connection:
-        rows = connection.execute("SELECT key,value FROM settings").fetchall()
-    values = {row["key"]: row["value"] for row in rows}
-    provider = values.get("provider", "")
-    configured = False
-    if provider:
-        try:
-            configured = bool(_key_store(provider))
-        except HTTPException:
-            configured = False
+def _settings_payload(values: dict[str, str]) -> dict[str, Any]:
+    provider = values.get("provider", "").lower().strip()
+    spec = providers.PROVIDERS.get(provider)
+    protocol = values.get("protocol", "")
+    base_url = values.get("base_url", "")
+    if spec is not None and provider != "custom":
+        protocol = spec.protocol
+    try:
+        endpoint = providers.resolve_config(provider, protocol or None, base_url or None)
+        resolved_protocol = endpoint.protocol
+        default_base_url = spec.base_url if spec else ""
+    except providers.ProviderError:
+        resolved_protocol = protocol
+        default_base_url = spec.base_url if spec else ""
     return {
         "provider": provider,
+        "provider_label": spec.label if spec else "",
+        "protocol": resolved_protocol,
+        "default_protocol": spec.protocol if spec else "",
+        "base_url": base_url,
+        "default_base_url": default_base_url,
         "model": values.get("model", ""),
+        "default_model": spec.default_model if spec else "",
+        "embedding_provider": "qwen",
         "embedding_model": values.get("embedding_model", DEFAULT_EMBED_MODEL),
-        "api_key_configured": configured,
+        "api_key_configured": bool(safe_key(provider)) if spec else False,
+        "embedding_key_configured": bool(safe_key("qwen")),
+        "providers": providers.public_catalog(),
+        "protocols": [{"id": key, "label": label} for key, label in providers.PROTOCOLS.items()],
         "data_dir": str(APP_HOME),
     }
 
 
+@app.get("/api/settings")
+def get_settings() -> dict[str, Any]:
+    with get_connection() as connection:
+        rows = connection.execute("SELECT key,value FROM settings").fetchall()
+    return _settings_payload({row["key"]: row["value"] for row in rows})
+
+
 @app.put("/api/settings")
 def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
-    provider = str(payload.get("provider", "")).lower()
-    model = str(payload.get("model", ""))
+    provider = str(payload.get("provider", "")).lower().strip()
+    protocol = str(payload.get("protocol", "")).lower().strip()
+    base_url = str(payload.get("base_url", "")).strip().rstrip("/")
+    model = str(payload.get("model", "")).strip()
     embedding_model = str(payload.get("embedding_model", "")).strip() or DEFAULT_EMBED_MODEL
     api_key = str(payload.get("api_key", ""))
-    if provider and provider not in PROVIDERS:
-        raise HTTPException(400, "仅支持 deepseek 或 qwen")
+    embedding_api_key = str(payload.get("embedding_api_key", ""))
+
+    if provider and provider not in providers.PROVIDERS:
+        raise HTTPException(400, "未知的模型供应商")
+    if provider:
+        saved_protocol = protocol or providers.PROVIDERS[provider].protocol
+        try:
+            resolved = providers.resolve_config(provider, saved_protocol, base_url or None)
+        except providers.ProviderError as error:
+            raise HTTPException(400, str(error)) from error
+        protocol = resolved.protocol
+        base_url = resolved.base_url
+    else:
+        protocol = ""
+        base_url = ""
+
+    values = {
+        "provider": provider,
+        "protocol": protocol,
+        "base_url": base_url,
+        "model": model,
+        "embedding_model": embedding_model,
+    }
+    for key, value in values.items():
+        if len(key) > 100 or len(value) > 10000:
+            raise HTTPException(400, "设置键或值过长")
+
     if api_key:
+        if not provider:
+            raise HTTPException(400, "请先选择模型供应商")
         _key_store(provider, api_key)
+    if embedding_api_key:
+        _key_store("qwen", embedding_api_key)
+
     with get_connection() as connection:
-        for key, value in {"provider": provider, "model": model, "embedding_model": embedding_model}.items():
-            if len(key) > 100 or len(value) > 10000:
-                raise HTTPException(400, "设置键或值过长")
+        for key, value in values.items():
             connection.execute(
                 "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
                 (key, value, utc_now()),
             )
-    configured = False
-    if provider:
-        try:
-            configured = bool(_key_store(provider))
-        except HTTPException:
-            configured = False
+    return _settings_payload(values)
+
+
+@app.get("/api/providers")
+def list_providers() -> dict[str, Any]:
     return {
-        "provider": provider, "model": model, "embedding_model": embedding_model,
-        "api_key_configured": configured, "data_dir": str(APP_HOME),
+        "providers": providers.public_catalog(),
+        "protocols": [{"id": key, "label": label} for key, label in providers.PROTOCOLS.items()],
     }
 
 
 @app.post("/api/models")
 def list_remote_models(payload: ModelsPayload) -> dict[str, Any]:
     provider = payload.provider.lower().strip()
-    if provider not in MODEL_ENDPOINTS:
-        raise HTTPException(400, "仅支持 deepseek 或 qwen")
-    key = payload.api_key.strip() if payload.api_key else _key_store(provider)
-    if not key:
-        raise HTTPException(400, "请先输入或配置该供应商的 API Key")
-    request = urllib.request.Request(
-        MODEL_ENDPOINTS[provider],
-        headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
-    )
+    if provider not in providers.PROVIDERS:
+        raise HTTPException(400, "未知的模型供应商")
+    saved_provider = (_setting("provider") or "").lower().strip()
+    protocol = payload.protocol
+    base_url = (payload.base_url or "").strip().rstrip("/") or None
+    if provider == saved_provider:
+        protocol = protocol or _setting("protocol") or None
+        base_url = base_url or _setting("base_url") or None
+    if provider == "custom" and not base_url:
+        raise HTTPException(400, "自定义供应商需要填写 Base URL")
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as error:
-        if error.code in (401, 403):
-            raise HTTPException(401, "API Key 无效或没有读取模型列表的权限") from error
-        raise HTTPException(502, f"{provider} 模型列表服务返回 HTTP {error.code}") from error
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-        raise HTTPException(502, f"{provider} 模型列表暂时不可用") from error
-    models = []
-    for item in data.get("data", []):
-        if isinstance(item, dict) and isinstance(item.get("id"), str):
-            models.append(item["id"])
-    if not models:
-        raise HTTPException(502, "供应商未返回可用模型列表")
-    return {"provider": provider, "models": sorted(set(models))}
+        endpoint = providers.resolve_config(provider, protocol, base_url)
+        key = payload.api_key.strip() if payload.api_key else (safe_key(provider) or "")
+        models = providers.list_models(endpoint, key)
+    except providers.ProviderError as error:
+        if error.status in (401, 403):
+            raise HTTPException(401, str(error)) from error
+        message = str(error)
+        if error.status is None and any(
+            token in message for token in ("Base URL", "API Key", "模型", "供应商")
+        ):
+            raise HTTPException(400, message) from error
+        raise HTTPException(502, message) from error
+    return {"provider": provider, "protocol": endpoint.protocol,
+            "base_url": endpoint.base_url, "models": models}
 
 
 @app.put("/api/settings/api-key/{provider}")
@@ -990,13 +1027,8 @@ def chat(paper_id: int, payload: ChatPayload) -> dict[str, Any]:
     message = (payload.message or payload.question).strip()
     if not message:
         raise HTTPException(400, "问题不能为空")
-    provider = (payload.provider or _default_provider()).lower()
-    if provider not in PROVIDERS:
-        raise HTTPException(400, "provider 必须是 deepseek 或 qwen")
-    key = _key_store(provider)
-    if not key:
-        raise HTTPException(400, f"{provider} 尚未配置 API key")
-    model = _resolve_model(provider)
+    endpoint, key, model = _chat_target(payload.provider)
+    provider = endpoint.id
     context, retrieved = _rag_context(paper_id, message)
     summary, recent = _paper_conversation_state(paper_id, provider, key, model)
     if payload.retry:
@@ -1045,13 +1077,8 @@ def general_chat(payload: ChatPayload) -> dict[str, Any]:
     message = (payload.message or payload.question).strip()
     if not message:
         raise HTTPException(400, "问题不能为空")
-    provider = (payload.provider or _default_provider()).lower()
-    if provider not in PROVIDERS:
-        raise HTTPException(400, "provider 必须是 deepseek 或 qwen")
-    key = _key_store(provider)
-    if not key:
-        raise HTTPException(400, f"{provider} 尚未配置 API key")
-    model = _resolve_model(provider)
+    endpoint, key, model = _chat_target(payload.provider)
+    provider = endpoint.id
     summary, recent = _general_conversation_state(provider, key, model)
     if payload.retry:
         # 重试：当前问题已在上次落库，避免在 prompt 里重复出现

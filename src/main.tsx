@@ -121,11 +121,34 @@ type Structured = {
   warnings?: string[];
   llm_available?: boolean;
 };
+type ProviderInfo = {
+  id: string;
+  label: string;
+  protocol: "openai" | "anthropic" | "gemini";
+  base_url: string;
+  default_model: string;
+  requires_key: boolean;
+  supports_model_list: boolean;
+};
+type ProtocolInfo = {
+  id: "openai" | "anthropic" | "gemini";
+  label: string;
+};
 type Settings = {
-  provider: "deepseek" | "qwen" | "";
+  provider: string;
+  provider_label: string;
+  protocol: string;
+  default_protocol: string;
+  base_url: string;
+  default_base_url: string;
   model: string;
+  default_model: string;
+  embedding_provider: string;
   embedding_model: string;
   api_key_configured: boolean;
+  embedding_key_configured: boolean;
+  providers: ProviderInfo[];
+  protocols: ProtocolInfo[];
   data_dir: string;
 };
 type Highlight = { page: number; bbox: [number, number, number, number] | null };
@@ -381,12 +404,23 @@ function App() {
   const [insightsLoading, setInsightsLoading] = useState(false);
   const [settings, setSettings] = useState<Settings>({
     provider: "",
+    provider_label: "",
+    protocol: "",
+    default_protocol: "",
+    base_url: "",
+    default_base_url: "",
     model: "",
+    default_model: "",
+    embedding_provider: "qwen",
     embedding_model: "text-embedding-v3",
     api_key_configured: false,
+    embedding_key_configured: false,
+    providers: [],
+    protocols: [],
     data_dir: "",
   });
   const [apiKey, setApiKey] = useState("");
+  const [embeddingApiKey, setEmbeddingApiKey] = useState("");
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
@@ -727,9 +761,18 @@ function App() {
       setSettings(await readResponse<Settings>(await fetch(`${API}/settings`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...settings, api_key: apiKey }),
+        body: JSON.stringify({
+          provider: settings.provider,
+          protocol: settings.protocol,
+          base_url: settings.base_url,
+          model: settings.model,
+          embedding_model: settings.embedding_model,
+          api_key: apiKey,
+          embedding_api_key: embeddingApiKey,
+        }),
       })));
       setApiKey("");
+      setEmbeddingApiKey("");
       setNotice("模型设置已保存。API Key 仅保存到本机安全存储，不写入日志或数据库。");
     } catch (error) {
       setNotice(`设置保存失败：${reasonOf(error)}`);
@@ -747,7 +790,12 @@ function App() {
       const payload = await readResponse<{ models: string[] }>(await fetch(`${API}/models`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider: settings.provider, api_key: apiKey || undefined }),
+        body: JSON.stringify({
+          provider: settings.provider,
+          protocol: settings.protocol || undefined,
+          base_url: settings.base_url || undefined,
+          api_key: apiKey || undefined,
+        }),
       }));
       setAvailableModels(payload.models);
       setNotice(`已读取 ${payload.models.length} 个可用模型。`);
@@ -822,6 +870,8 @@ function App() {
               settings={settings}
               apiKey={apiKey}
               setApiKey={setApiKey}
+              embeddingApiKey={embeddingApiKey}
+              setEmbeddingApiKey={setEmbeddingApiKey}
               setSettings={setSettings}
               onSave={saveSettings}
               availableModels={availableModels}
@@ -1394,6 +1444,8 @@ function SettingsView({
   settings,
   apiKey,
   setApiKey,
+  embeddingApiKey,
+  setEmbeddingApiKey,
   setSettings,
   onSave,
   availableModels,
@@ -1402,11 +1454,16 @@ function SettingsView({
   settings: Settings;
   apiKey: string;
   setApiKey: (value: string) => void;
+  embeddingApiKey: string;
+  setEmbeddingApiKey: (value: string) => void;
   setSettings: (value: Settings) => void;
   onSave: (event: FormEvent) => void;
   availableModels: string[];
   loadModels: () => void;
 }) {
+  const protocolLabel = settings.protocols.find((item) => item.id === settings.protocol)?.label
+    || settings.protocol
+    || "未配置";
   return (
     <section className="settings">
       <span className="eyebrow">LOCAL CONFIGURATION</span>
@@ -1417,16 +1474,57 @@ function SettingsView({
           模型供应商
           <select
             value={settings.provider}
-            onChange={(event) => setSettings({
-              ...settings,
-              provider: event.target.value as Settings["provider"],
-              model: "",
-            })}
+            onChange={(event) => {
+              const provider = event.target.value;
+              const info = settings.providers.find((item) => item.id === provider);
+              setSettings({
+                ...settings,
+                provider,
+                provider_label: info?.label || "",
+                protocol: info?.protocol || "",
+                default_protocol: info?.protocol || "",
+                base_url: info?.base_url || "",
+                default_base_url: info?.base_url || "",
+                model: info?.default_model || "",
+                default_model: info?.default_model || "",
+                api_key_configured: false,
+              });
+            }}
           >
             <option value="">未配置</option>
-            <option value="deepseek">DeepSeek</option>
-            <option value="qwen">Qwen / 通义千问</option>
+            {settings.providers.map((item) => (
+              <option key={item.id} value={item.id}>{item.label}</option>
+            ))}
           </select>
+        </label>
+        <label>
+          接口协议
+          {settings.provider === "custom" ? (
+            <select
+              value={settings.protocol || "openai"}
+              onChange={(event) => setSettings({ ...settings, protocol: event.target.value })}
+            >
+              {settings.protocols.map((item) => (
+                <option key={item.id} value={item.id}>{item.label}</option>
+              ))}
+            </select>
+          ) : (
+            <input value={protocolLabel} readOnly />
+          )}
+          <small className="field-help">
+            供应商按协议适配：OpenAI 兼容、Anthropic Messages、Google Gemini。自定义供应商可任选一种。
+          </small>
+        </label>
+        <label>
+          Base URL
+          <input
+            value={settings.base_url}
+            onChange={(event) => setSettings({ ...settings, base_url: event.target.value })}
+            placeholder={settings.default_base_url || "例如 https://api.openai.com/v1"}
+          />
+          <small className="field-help">
+            通常填写到版本路径（如 /v1）；留空使用该供应商默认地址。自定义供应商必须填写。
+          </small>
         </label>
         <label>
           API Key
@@ -1434,7 +1532,9 @@ function SettingsView({
             type="password"
             value={apiKey}
             onChange={(event) => setApiKey(event.target.value)}
-            placeholder={settings.api_key_configured ? "已配置（输入新 Key 可替换）" : "输入后可读取模型列表"}
+            placeholder={settings.api_key_configured
+              ? "已配置（输入新 Key 可替换）"
+              : "输入后可读取模型列表"}
           />
         </label>
         <div className="model-row">
@@ -1456,6 +1556,10 @@ function SettingsView({
           />
           <small className="field-help">读取列表后可直接选择；保存后问答请求会使用这里的名称。</small>
         </label>
+        <div className="security-note">
+          读取模型列表和远端问答都会向所选供应商发送请求。API Key 不会发送给开发者服务器，也不会写入论文数据库。
+        </div>
+        <h3 className="settings-section">语义检索嵌入</h3>
         <label>
           嵌入模型
           <input
@@ -1463,11 +1567,24 @@ function SettingsView({
             onChange={(event) => setSettings({ ...settings, embedding_model: event.target.value })}
             placeholder="text-embedding-v3"
           />
-          <small className="field-help">用于语义检索与问答召回的向量模型（千问/DashScope，向量仍存本机）。</small>
+          <small className="field-help">
+            固定使用千问 DashScope 兼容接口（默认 text-embedding-v3），向量仍存本机。
+          </small>
         </label>
-        <div className="security-note">
-          读取模型列表和远端问答都会向所选供应商发送请求。API Key 不会发送给开发者服务器，也不会写入论文数据库。
-        </div>
+        <label>
+          DashScope 嵌入 API Key
+          <input
+            type="password"
+            value={embeddingApiKey}
+            onChange={(event) => setEmbeddingApiKey(event.target.value)}
+            placeholder={settings.embedding_key_configured
+              ? "已配置（输入新 Key 可替换）"
+              : "可与问答供应商的 Key 不同"}
+          />
+          <small className="field-help">
+            嵌入 Key 与问答 Key 分开保存；问答供应商不是 Qwen 时仍需单独配置。
+          </small>
+        </label>
         <button className="primary" type="submit">保存设置</button>
       </form>
       <div className="data-card">

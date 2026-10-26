@@ -2,7 +2,9 @@
 
 面向医学生和临床研究者的论文精读助手。导入 PDF 后，在本机完成解析、混合检索与可核验问答；数据默认只存本机，只有主动使用模型功能时才向远端供应商发送必要的文本片段。
 
-问答与嵌入仍使用远端模型（DeepSeek / Qwen），**不引入本地模型推理**；检索索引、原文、向量和问答历史全部落在本机。
+问答与嵌入仍使用远端模型，**不引入本地模型推理**；检索索引、原文、向量和问答历史全部落在本机。问答模型支持 OpenAI、DeepSeek、Qwen、Anthropic Claude、Google Gemini、Moonshot、智谱、SiliconFlow、OpenRouter、Groq、Mistral、Ollama 以及自定义网关；供应商按 **OpenAI 兼容 / Anthropic Messages / Gemini** 三种协议适配，新增同协议厂商只需增加配置。
+
+语义检索嵌入仍固定使用千问 DashScope 兼容接口（默认 `text-embedding-v3`），向量存本机。问答供应商与嵌入供应商的 Key 分开保存，因此可以把 OpenAI 作为问答模型、同时用千问计算嵌入。
 
 ## 能力概览
 
@@ -13,6 +15,16 @@
 - 每次运行记录 `thought / tool / args / observation / duration`，前端展示可展开的执行轨迹。
 - 自动模式：带 `paper_id` 时限定当前论文；不带时在已有论文库中检索；库为空时走通用医学知识。
 - 最大步数、非法 JSON 修正、工具异常降级、无证据兜底均有明确处理。
+
+### 多供应商与协议适配
+
+- 供应商只是配置，协议决定请求/响应格式；同一个 Agent、结构化精读和追问链路可切换不同厂商。
+- `openai`：OpenAI 兼容 Chat Completions，支持 Bearer Key、`/models` 列表和 SSE 流式增量。
+- `anthropic`：Messages API，使用 `x-api-key` + `anthropic-version`，流式解析 `content_block_delta`。
+- `gemini`：`generateContent` / `streamGenerateContent`，使用 `x-goog-api-key`，支持 system instruction 和模型列表过滤。
+- 「自定义」供应商可选择协议并填写 Base URL；内置供应商也允许覆盖 Base URL，方便代理或自建网关。
+- Ollama / 自定义本地网关可以留空 API Key；需要 Key 的供应商会给出明确提示。
+- 问答 Key 与 DashScope 嵌入 Key 分开存储；切换问答供应商不会把其 Key 发送到嵌入接口。
 
 ### 可核验引用
 
@@ -50,11 +62,11 @@
 |---|---|
 | 前端 | React 19 + TypeScript + Vite + pdfjs-dist + react-markdown/GFM |
 | 后端 | FastAPI + PyMuPDF + SQLite(FTS5) + LanceDB |
-| 问答模型 | DeepSeek / Qwen（远端，可选） |
+| 问答模型 | OpenAI / Anthropic / Gemini 协议及多家 OpenAI 兼容供应商（远端，可选） |
 | 嵌入模型 | Qwen DashScope `text-embedding-v3`（远端计算，向量存本机） |
 | 测试/评测 | Python `unittest` + 离线 golden set |
 
-> 语义检索和向量问答需要 Qwen（DashScope）Key；DeepSeek 不提供嵌入接口。没有嵌入 Key 时自动退化为关键词检索，导入、阅读和关键词问答仍可用。
+> 语义检索和向量问答需要 Qwen（DashScope）Key；其他问答供应商不提供 DashScope 嵌入。没有嵌入 Key 时自动退化为关键词检索，导入、阅读和关键词问答仍可用。OpenAI、Gemini 等也可以用于问答，但不会把各自 Key 发往 DashScope。
 
 ## 环境要求
 
@@ -102,7 +114,7 @@ npm run dev
 
 ## 使用流程
 
-1. **配置模型**：设置与隐私 → 选择 DeepSeek 或 Qwen → 填 API Key → 读取模型 → 保存。
+1. **配置模型**：设置与隐私 → 选择供应商（或「自定义」并选择协议、填写 Base URL）→ 填 API Key → 读取模型或手动填写模型 ID → 保存。语义检索另需配置 DashScope 嵌入 Key。
 2. **导入论文**：论文库 → 导入带文本层的 PDF（≤50MB、≤300 页）。上传后立即返回，首页卡片显示解析/向量化进度；完成后自动打开工作台。
 3. **全库检索**：首页「全库检索」输入问题或术语，结果带论文标题、页码和混合检索来源，点击直接跳转并高亮。
 4. **论文内问答**：工作台 → 论文内问答。展开「执行轨迹」可查看检索/翻页/计算等步骤和引用核验状态。
@@ -113,7 +125,7 @@ npm run dev
 
 - 默认数据目录：用户目录下的 `PaperReader`（Windows 为 `%USERPROFILE%\PaperReader`），可用 `PAPER_READER_HOME` 覆盖。
 - 目录内容：`papers/`（原始 PDF）、`database/`（SQLite）、`vectors/`（LanceDB）、`cache/`、`logs/`、`exports/`。
-- 远端调用边界：读取模型列表、结构化精读、Agent 问答、嵌入计算会访问所选供应商；只发送问题、必要原文片段和嵌入文本。API Key 保存在系统凭据库。
+- 远端调用边界：读取模型列表、结构化精读、Agent 问答会访问所选问答供应商；嵌入计算只会访问 DashScope。只发送问题、必要原文片段和嵌入文本。问答 Key 与嵌入 Key 分别保存在系统凭据库。
 - Agent 运行轨迹、引用和反馈保存在本地 SQLite（`agent_runs`、`agent_steps`、`feedback`）。
 
 ## API 一览
@@ -130,7 +142,10 @@ npm run dev
 | GET | `/api/agent/runs/{run_id}` | 运行轨迹与引用 |
 | GET/POST | `/api/papers/{id}/structured` | 读取缓存/规则字段；POST 强制 LLM 提取 |
 | POST | `/api/feedback` | 保存回答反馈 |
-| GET/PUT | `/api/settings` | 模型与本地数据目录设置 |
+| GET/PUT | `/api/settings` | 供应商、协议、Base URL、模型与嵌入设置 |
+| GET | `/api/providers` | 可用供应商与协议列表 |
+| POST | `/api/models` | 按协议读取供应商模型列表 |
+| PUT/GET | `/api/settings/api-key/{provider}` | 保存/查询单个供应商 Key |
 
 ### Agent 请求示例
 
@@ -154,7 +169,7 @@ curl -N http://127.0.0.1:8765/api/agent/chat \
 npm run build
 ```
 
-覆盖范围：中英文关键词检索、词表扩展、RRF、Agent 工具调用、引用修正与兜底、引文核验、急症安全提示、结构化提取缓存、真实 PDF 摄取、后台状态字段、数据库迁移、离线评测。
+覆盖范围：中英文关键词检索、词表扩展、RRF、Agent 工具调用、引用修正与兜底、引文核验、急症安全提示、结构化提取缓存、真实 PDF 摄取、后台状态字段、数据库迁移、离线评测，以及 OpenAI / Anthropic / Gemini 三种协议的请求头、请求体、流式解析和模型列表解析。
 
 ## 评测
 
@@ -203,7 +218,7 @@ backend/
   storage.py        # 路径、SQLite schema、WAL、迁移
   safety.py         # 急症提示、免责声明、不可信文档包裹
   medical_terms.py  # 中英医学词表扩展
-  providers.py      # DeepSeek/Qwen OpenAI-compatible 客户端
+  providers.py      # 供应商注册表 + OpenAI/Anthropic/Gemini 协议适配
   embedding.py      # DashScope 嵌入 + LanceDB
   evaluation.py     # 检索/引用离线评测
   credentials.py    # 系统凭据库
@@ -224,7 +239,9 @@ start.py            # 一键启动
 
 - 扫描版 PDF（无文字层）不做 OCR，导入后标记「需 OCR」。
 - 表格检测依赖 PDF 边框线，无边框表格可能无法转成 Markdown。
-- 语义检索依赖远端嵌入服务；服务不可用时自动退化为关键词检索。
+- 语义检索依赖远端 DashScope 嵌入服务；服务不可用时自动退化为关键词检索。
+- 模型列表接口并非所有兼容网关都实现；读取失败时可直接手动填写模型 ID。
+- 自定义供应商只有一个 Key 槽位；切换 Base URL 会复用同一把 Key。
 - 医学词表是人工维护的小型映射，不替代 UMLS/SNOMED 等本体。
 - 评测语料为合成数据，只验证检索与引用机制，不构成临床证据。
 - 单机单用户，无账号/多租户体系。

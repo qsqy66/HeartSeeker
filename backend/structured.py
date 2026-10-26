@@ -237,26 +237,38 @@ def _heuristic_fields(db_path: Path | str, paper_id: int) -> dict[str, Any]:
 
 
 def extract_fields(paper_id: int, db_path: Path | str, provider: str, key: str,
-                   model: str, force: bool = False, use_llm: bool = True) -> dict[str, Any]:
+                   model: str, force: bool = False, use_llm: bool = True,
+                   protocol: Optional[str] = None,
+                   base_url: Optional[str] = None) -> dict[str, Any]:
     paper = _paper_row(db_path, paper_id)
     if paper is None:
         raise ValueError("论文不存在")
+    try:
+        endpoint = providers.resolve_config(provider, protocol, base_url)
+    except providers.ProviderError:
+        endpoint = None
+    # Keyless local gateways (Ollama / self-hosted) can call an LLM without a
+    # credential; a missing key only disables providers that require one.
+    can_call_llm = endpoint is not None and (bool(key) or not endpoint.requires_key)
+    llm_available = can_call_llm
     content_hash = hashlib.sha256(
-        f"{paper.get('sha256', '')}:{paper_id}:{PROMPT_VERSION}".encode("utf-8")
+        f"{paper.get('sha256', '')}:{paper_id}:{PROMPT_VERSION}:"
+        f"{provider}:{protocol or ''}:{base_url or ''}".encode("utf-8")
     ).hexdigest()
     if not force:
         cached = _cache_get(db_path, paper_id, content_hash, provider, model)
         if cached:
             cached.update({"paper_id": paper_id, "paper_title": paper["title"],
-                           "llm_available": bool(key)})
+                           "llm_available": llm_available})
             return cached
 
-    if not key or not use_llm:
+    if not use_llm or not can_call_llm:
         fields = _heuristic_fields(db_path, paper_id)
-        warning = "未配置问答模型，使用正则抽取。" if not key else "已返回快速正则抽取结果。"
+        warning = ("未配置问答模型，使用正则抽取。" if not key
+                   else "已返回快速正则抽取结果。")
         return {"paper_id": paper_id, "paper_title": paper["title"], "fields": fields,
                 "source": "heuristic", "cached": False, "warnings": [warning],
-                "llm_available": bool(key), "generated_at": _now()}
+                "llm_available": llm_available, "generated_at": _now()}
 
     context, chunks = _context_chunks(db_path, paper_id)
     if not context:
@@ -288,7 +300,7 @@ def extract_fields(paper_id: int, db_path: Path | str, provider: str, key: str,
 {wrap_untrusted(context)}
 """
     try:
-        raw = providers.chat_json(provider, key, model, [
+        raw = providers.chat_json(endpoint, key, model, [
             {"role": "system", "content": "你是严谨的医学论文信息抽取器，只输出合法 JSON。"},
             {"role": "user", "content": prompt},
         ], temperature=0.0, timeout=120)
@@ -303,4 +315,4 @@ def extract_fields(paper_id: int, db_path: Path | str, provider: str, key: str,
     _cache_put(db_path, paper_id, content_hash, provider, model, fields, source)
     return {"paper_id": paper_id, "paper_title": paper["title"], "fields": fields,
             "source": source, "cached": False, "warnings": warnings,
-            "llm_available": bool(key), "generated_at": _now()}
+            "llm_available": llm_available, "generated_at": _now()}

@@ -76,3 +76,5 @@
 .unverified-text{color:#9a6221!important}
 @media(max-width:640px){.library-search-row{flex-direction:column}.library-search-row button{padding:10px}.head-actions{flex-wrap:wrap}}
 .head-actions button.danger{border-color:#e3bebe;background:#fff;color:#a34040}
+.settings-section{margin:8px 0 -4px;padding-top:16px;border-top:1px solid #e8efeb;font-size:15px;color:#34534a}
+.settings-form input[readonly]{background:#f2f6f4;color:#557168}

@@ -1,9 +1,9 @@
 """A small, auditable medical research agent.
 
-The model is remote (DeepSeek/Qwen), but every step runs locally: the agent
-chooses a tool, the tool queries the local SQLite/LanceDB indexes, and the
-observation is appended to the transcript.  There is no hidden framework and
-no client-side tool execution.
+The model is remote (any provider supported by :mod:`backend.providers`), but
+every step runs locally: the agent chooses a tool, the tool queries the local
+SQLite/LanceDB indexes, and the observation is appended to the transcript.
+There is no hidden framework and no client-side tool execution.
 
 Protocol
 --------
@@ -47,6 +47,8 @@ class AgentConfig:
     paper_id: Optional[int] = None
     max_steps: int = MAX_STEPS
     temperature: float = 0.1
+    protocol: Optional[str] = None
+    base_url: Optional[str] = None
     history: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -215,6 +217,7 @@ class AgentRunner:
                  chat_fn: Optional[Callable[[list[dict[str, str]]], str]] = None,
                  enable_vectors: bool = True) -> None:
         self.config = config
+        self.endpoint = providers.resolve_config(config.provider, config.protocol, config.base_url)
         self.db_path = Path(db_path)
         self.vectors_dir = Path(vectors_dir)
         self.enable_vectors = enable_vectors
@@ -225,13 +228,14 @@ class AgentRunner:
         self.papers: list[dict[str, Any]] = []
 
     def _default_chat(self, messages: list[dict[str, str]]) -> str:
-        return providers.chat(self.config.provider, self.config.key, self.config.model,
+        return providers.chat(self.endpoint, self.config.key, self.config.model,
                               messages, temperature=self.config.temperature, timeout=120)
 
     @property
     def _embedding_key(self) -> Optional[str]:
-        # Embeddings always use DashScope/Qwen, never the DeepSeek chat key.
-        return self.config.key if self.config.provider == "qwen" else None
+        # Embeddings always use DashScope/Qwen, never another vendor's chat key.
+        from .credentials import safe_key
+        return safe_key("qwen")
 
     # --- tool plumbing -------------------------------------------------------------
 
@@ -389,7 +393,9 @@ class AgentRunner:
                 raise ValueError("extract_paper 需要 paper_id")
             from .structured import extract_fields
             analysis = extract_fields(paper_id, self.db_path, self.config.provider,
-                                      self.config.key, self.config.model)
+                                      self.config.key, self.config.model,
+                                      protocol=self.config.protocol,
+                                      base_url=self.config.base_url)
             evidence: list[dict[str, Any]] = []
             for field_value in (analysis.get("fields") or {}).values():
                 for item in field_value.get("evidence") or []:

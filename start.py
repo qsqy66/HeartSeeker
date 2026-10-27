@@ -84,6 +84,33 @@ def _node_major() -> int | None:
         return None
 
 
+def dist_available() -> bool:
+    return (ROOT / "dist" / "index.html").is_file()
+
+
+def resolve_frontend_mode(dev: bool, prod: bool) -> str:
+    """Return ``"dev"`` (Vite) or ``"built"`` (backend serves dist/)."""
+    if dev and prod:
+        log("error", "--dev 与 --prod 不能同时使用")
+        raise SystemExit(2)
+    if dev:
+        return "dev"
+    if prod:
+        if not dist_available():
+            log("error", "未找到 dist/index.html，请先运行 npm run build 或加 --build")
+            raise SystemExit(1)
+        return "built"
+    return "built" if dist_available() else "dev"
+
+
+def build_frontend() -> None:
+    require_node()
+    ensure_frontend_deps()
+    npm = "npm.cmd" if os.name == "nt" else "npm"
+    log("setup", "构建前端 (npm run build) …")
+    _run([npm, "run", "build"], check=True)
+
+
 def require_node() -> None:
     """启动前端前校验 Node.js 18+，缺失或过旧时给出明确提示。"""
     major = _node_major()
@@ -165,8 +192,11 @@ def start_frontend() -> subprocess.Popen:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="一键启动 Paper Reader（后端 + 前端）")
+    parser = argparse.ArgumentParser(description="一键启动 Paper Reader")
     parser.add_argument("--no-browser", action="store_true", help="启动后不自动打开浏览器")
+    parser.add_argument("--dev", action="store_true", help="强制启动 Vite 开发前端（需要 Node.js）")
+    parser.add_argument("--prod", action="store_true", help="只启动后端并托管已构建的 dist/")
+    parser.add_argument("--build", action="store_true", help="先构建前端，再以单进程模式启动")
     args = parser.parse_args()
 
     if sys.version_info < (3, 10):
@@ -180,30 +210,36 @@ def main() -> int:
         except (ValueError, OSError):
             pass
 
+    mode = resolve_frontend_mode(args.dev, args.prod)
+    if args.build:
+        build_frontend()
+        mode = "built"
+    app_url = BACKEND_URL if mode == "built" else FRONTEND_URL
+
     # 已在运行的服务直接复用，只启动缺失的部分
     backend_up = wait_http(f"{BACKEND_URL}/api/health", timeout=1.0)
-    frontend_up = wait_http(FRONTEND_URL, timeout=1.0)
+    frontend_up = backend_up if mode == "built" else wait_http(FRONTEND_URL, timeout=1.0)
     if backend_up and frontend_up:
         log("ok", "Paper Reader 已在运行，直接打开浏览器。")
         if not args.no_browser:
-            webbrowser.open(FRONTEND_URL)
+            webbrowser.open(app_url)
         return 0
 
     log("setup", "检查环境 …")
     py = None
-    if not frontend_up:
+    if mode == "dev" and not frontend_up:
         require_node()
     if not backend_up:
         py = ensure_venv()
         ensure_backend_deps(py)
-    if not frontend_up:
+    if mode == "dev" and not frontend_up:
         ensure_frontend_deps()
 
     backend_proc = None
     frontend_proc = None
     if not backend_up:
         backend_proc = start_backend(py)
-    if not frontend_up:
+    if mode == "dev" and not frontend_up:
         frontend_proc = start_frontend()
 
     if not backend_up:
@@ -214,7 +250,7 @@ def main() -> int:
             return 1
         log("ok", f"后端就绪：{BACKEND_URL}/api/health")
 
-    if not frontend_up:
+    if mode == "dev" and not frontend_up:
         log("info", "等待前端就绪 …")
         if not wait_http(FRONTEND_URL, proc=frontend_proc):
             log("error", "前端启动失败：端口可能被占用或依赖未就绪，请查看上方日志。")
@@ -224,11 +260,14 @@ def main() -> int:
 
     if not args.no_browser:
         try:
-            webbrowser.open(FRONTEND_URL)
+            webbrowser.open(app_url)
         except Exception:
             pass
 
-    print(f"\n✅ Paper Reader 已启动：{FRONTEND_URL}\n   按 Ctrl+C 停止两个服务。\n", flush=True)
+    if mode == "built":
+        print(f"\n✅ Paper Reader 已启动（单进程模式）：{app_url}\n   按 Ctrl+C 停止服务。\n", flush=True)
+    else:
+        print(f"\n✅ Paper Reader 已启动：{app_url}\n   按 Ctrl+C 停止两个服务。\n", flush=True)
     try:
         while True:
             for name, proc in _procs:

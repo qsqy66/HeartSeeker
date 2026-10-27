@@ -468,9 +468,17 @@ def shutdown() -> None:
     _IMPORT_EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
 
+DIST_DIR = Path(__file__).resolve().parents[1] / "dist"
+
+
+def _frontend_built() -> bool:
+    return (DIST_DIR / "index.html").is_file()
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "storage": str(APP_HOME)}
+    return {"status": "ok", "storage": str(APP_HOME),
+            "frontend": "built" if _frontend_built() else "source"}
 
 
 @app.get("/api/papers")
@@ -1162,3 +1170,46 @@ def retry_paper(paper_id: int) -> dict[str, Any]:
         raise HTTPException(410, "原始 PDF 已丢失，请重新导入")
     _enqueue_import(paper_id, path)
     return {"id": paper_id, "status": "processing"}
+
+
+# --- Built frontend (single-process production mode) ---------------------------------
+# The API routes above are registered first, so this SPA fallback never shadows
+# them.  In dev mode Vite serves the frontend and these routes are unused.
+
+def _dist_file(relative: str) -> Optional[Path]:
+    if not DIST_DIR.is_dir():
+        return None
+    candidate = (DIST_DIR / relative).resolve()
+    try:
+        candidate.relative_to(DIST_DIR.resolve())
+    except ValueError:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _index_response():
+    from fastapi.responses import FileResponse
+
+    index = _dist_file("index.html")
+    if index is None:
+        raise HTTPException(404, "前端尚未构建，请运行 npm run build，或用 --dev 启动 Vite")
+    return FileResponse(index, media_type="text/html",
+                        headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/", include_in_schema=False)
+def frontend_index():
+    return _index_response()
+
+
+@app.get("/{path:path}", include_in_schema=False)
+def frontend_assets(path: str):
+    if path.startswith("api/"):
+        raise HTTPException(404, "接口不存在")
+    file = _dist_file(path)
+    if file is not None:
+        cache = ("public, max-age=31536000, immutable"
+                 if path.startswith("assets/") else "no-cache")
+        from fastapi.responses import FileResponse
+        return FileResponse(file, headers={"Cache-Control": cache})
+    return _index_response()

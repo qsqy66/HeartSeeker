@@ -909,6 +909,10 @@ def _settings_payload(values: dict[str, str]) -> dict[str, Any]:
         "ocr_lang": values.get("ocr_lang", ocr_module.DEFAULT_LANG),
         "ocr_dpi": values.get("ocr_dpi", str(ocr_module.DEFAULT_DPI)),
         "ocr_available": _ocr_available(values.get("ocr_engine", "auto")),
+        "rerank_enabled": values.get("rerank_enabled", "true"),
+        "rerank_engine": values.get("rerank_engine", "lexical"),
+        "rerank_model": values.get("rerank_model", ""),
+        "relevance_min_coverage": values.get("relevance_min_coverage", "0"),
         "api_key_configured": bool(safe_key(provider)) if spec else False,
         "embedding_key_configured": bool(safe_key("qwen")),
         "providers": providers.public_catalog(),
@@ -956,8 +960,10 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
         "embedding_model": embedding_model,
     }
     # Optional local-pipeline settings are only written when supplied.
-    for key in ("ocr_enabled", "ocr_engine", "ocr_lang", "ocr_dpi"):
-        if key in payload and str(payload[key]).strip():
+    for key in ("ocr_enabled", "ocr_engine", "ocr_lang", "ocr_dpi",
+                "rerank_enabled", "rerank_engine", "rerank_model",
+                "relevance_min_coverage"):
+        if key in payload and str(payload[key]).strip() != "":
             values[key] = str(payload[key]).strip()
     for key, value in values.items():
         if len(key) > 100 or len(value) > 10000:

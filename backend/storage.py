@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from . import tokenization
+
 APP_HOME = Path(os.environ.get("PAPER_READER_HOME", Path.home() / "PaperReader"))
 PAPERS_DIR = APP_HOME / "papers"
 DB_PATH = APP_HOME / "database" / "paper_reader.sqlite3"
@@ -44,6 +46,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
     chunk_index INTEGER NOT NULL,
     text TEXT NOT NULL,
+    search_text TEXT NOT NULL DEFAULT '',
     x0 REAL, y0 REAL, x1 REAL, y1 REAL,
     section TEXT NOT NULL DEFAULT '',
     heading TEXT NOT NULL DEFAULT ''
@@ -170,6 +173,43 @@ def ensure_column(connection: sqlite3.Connection, table: str, column: str, ddl: 
         connection.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
+def _ensure_search_index(connection: sqlite3.Connection) -> None:
+    """Create/backfill the segmented FTS index used for Chinese BM25.
+
+    Runs after column migrations so legacy databases without ``search_text``
+    are upgraded in place.  ``jieba`` is optional; the bigram fallback keeps
+    the index deterministic.
+    """
+    connection.executescript(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_seg USING fts5("
+        "search_text, content='chunks', content_rowid='id');"
+        "CREATE TRIGGER IF NOT EXISTS chunks_search_ai AFTER INSERT ON chunks BEGIN "
+        "INSERT INTO chunks_fts_seg(rowid, search_text) VALUES (new.id, new.search_text); "
+        "END;"
+        "CREATE TRIGGER IF NOT EXISTS chunks_search_ad AFTER DELETE ON chunks BEGIN "
+        "INSERT INTO chunks_fts_seg(chunks_fts_seg, rowid, search_text) "
+        "VALUES ('delete', old.id, old.search_text); "
+        "END;"
+        "CREATE TRIGGER IF NOT EXISTS chunks_search_au AFTER UPDATE OF search_text ON chunks BEGIN "
+        "INSERT INTO chunks_fts_seg(chunks_fts_seg, rowid, search_text) "
+        "VALUES ('delete', old.id, old.search_text); "
+        "INSERT INTO chunks_fts_seg(rowid, search_text) VALUES (new.id, new.search_text); "
+        "END;"
+    )
+    rows = connection.execute(
+        "SELECT id, text, search_text FROM chunks WHERE text != ''"
+    ).fetchall()
+    for row in rows:
+        expected = tokenization.segment(row["text"])
+        if expected != (row["search_text"] or ""):
+            connection.execute("UPDATE chunks SET search_text=? WHERE id=?",
+                               (expected, row["id"]))
+    indexed = connection.execute("SELECT COUNT(*) AS n FROM chunks_fts_seg").fetchone()["n"]
+    total = connection.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()["n"]
+    if indexed != total:
+        connection.execute("INSERT INTO chunks_fts_seg(chunks_fts_seg) VALUES('rebuild')")
+
+
 def initialize_storage(app_home: Optional[Path | str] = None,
                        db_path: Optional[Path | str] = None,
                        papers_dir: Optional[Path | str] = None,
@@ -199,4 +239,6 @@ def initialize_storage(app_home: Optional[Path | str] = None,
         ensure_column(connection, "chunks", "y1", "y1 REAL")
         ensure_column(connection, "chunks", "section", "section TEXT NOT NULL DEFAULT ''")
         ensure_column(connection, "chunks", "heading", "heading TEXT NOT NULL DEFAULT ''")
+        ensure_column(connection, "chunks", "search_text", "search_text TEXT NOT NULL DEFAULT ''")
+        _ensure_search_index(connection)
         connection.commit()

@@ -14,7 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
-from . import citations, retrieval
+from . import citations, retrieval, tokenization
 from .storage import get_connection, initialize_storage, utc_now
 from .structured import UNREPORTED
 
@@ -65,10 +65,12 @@ def build_fixture(corpus_path: Path | str, app_home: Path | str) -> tuple[Path, 
                 page_id = page_ids.get(page_number)
                 if page_id is None:
                     continue
+                chunk_text = str(chunk.get("text") or "")
                 connection.execute(
-                    "INSERT INTO chunks(paper_id,page_id,chunk_index,text,section,heading) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (paper_id, page_id, index, str(chunk.get("text") or ""),
+                    "INSERT INTO chunks(paper_id,page_id,chunk_index,text,search_text,section,heading) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (paper_id, page_id, index, chunk_text,
+                     tokenization.segment(chunk_text),
                      str(chunk.get("section") or ""), str(chunk.get("heading") or "")),
                 )
         connection.commit()

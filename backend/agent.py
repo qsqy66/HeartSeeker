@@ -244,7 +244,7 @@ class AgentRunner:
             page = row.get("page_number")
             if page is None:
                 continue
-            text = row.get("text") or ""
+            text = row.get("context_text") or row.get("text") or ""
             if not text.strip():
                 continue
             key = (row.get("paper_id"), int(page), row.get("chunk_id"), hash(text[:300]))
@@ -320,7 +320,8 @@ class AgentRunner:
                  "paper_title": row.get("paper_title", ""),
                  "page_number": row["page_number"], "section": row.get("section", ""),
                  "heading": row.get("heading", ""),
-                 "text": _clip(row.get("text"), 1600), "score": row.get("score")}
+                 "text": _clip(row.get("context_text") or row.get("text"), 2200),
+                 "score": row.get("score")}
                 for row in rows
             ]}, rows
         if tool == "read_page":

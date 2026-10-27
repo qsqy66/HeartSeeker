@@ -13,6 +13,7 @@ from typing import Any, Callable, Optional
 import fitz
 
 from . import ocr as ocr_module
+from . import tokenization
 from .embedding import (
     DEFAULT_EMBED_MODEL,
     delete_paper_vectors,
@@ -143,9 +144,17 @@ def is_heading(el: dict[str, Any], body_size: float) -> bool:
     return False
 
 
+CHUNK_OVERLAP = 200
+
+
 def _split_text(text: str, x0: float, y0: float, x1: float, y1: float,
-                section: str, heading: str, max_len: int = 1200) -> list[dict[str, Any]]:
-    """Split a long block into sub-chunks that all share the same provenance."""
+                section: str, heading: str, max_len: int = 1200,
+                overlap: int = CHUNK_OVERLAP) -> list[dict[str, Any]]:
+    """Split a long block into overlapping sub-chunks with shared provenance.
+
+    Overlap keeps definitions and methods that straddle a boundary retrievable
+    by either side; all parts still point at the same page/bbox.
+    """
     if len(text) <= max_len:
         return [{"text": text, "x0": x0, "y0": y0, "x1": x1, "y1": y1,
                  "section": section, "heading": heading}]
@@ -158,7 +167,9 @@ def _split_text(text: str, x0: float, y0: float, x1: float, y1: float,
             if cut > start + max_len * 0.5:
                 end = cut + 1
         parts.append(text[start:end])
-        start = end
+        if end >= len(text):
+            break
+        start = max(start + 1, end - max(0, min(overlap, max_len // 2)))
     return [{"text": part, "x0": x0, "y0": y0, "x1": x1, "y1": y1,
              "section": section, "heading": heading} for part in parts]
 
@@ -314,11 +325,13 @@ def process_document(paper_id: int, document, db_path: Path | str,
                         (page_id, *block[:4], str(block[4]).strip()),
                     )
             for chunk_index, chunk in enumerate(chunks):
+                search_text = tokenization.segment(chunk["text"])
                 cursor = connection.execute(
-                    "INSERT INTO chunks(paper_id, page_id, chunk_index, text, x0, y0, x1, y1, section, heading) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (paper_id, page_id, chunk_index, chunk["text"], chunk["x0"], chunk["y0"],
-                     chunk["x1"], chunk["y1"], chunk["section"], chunk["heading"]),
+                    "INSERT INTO chunks(paper_id, page_id, chunk_index, text, search_text, "
+                    "x0, y0, x1, y1, section, heading) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (paper_id, page_id, chunk_index, chunk["text"], search_text,
+                     chunk["x0"], chunk["y0"], chunk["x1"], chunk["y1"],
+                     chunk["section"], chunk["heading"]),
                 )
                 chunk_rows.append({
                     "id": cursor.lastrowid, "paper_id": paper_id, "page_id": page_id,

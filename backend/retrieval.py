@@ -16,6 +16,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from . import rerank as rerank_module
+from . import tokenization
 from .credentials import safe_key
 from .embedding import DEFAULT_EMBED_MODEL, embed_texts, normalize, search_chunks
 from .medical_terms import expand_query
@@ -97,6 +99,31 @@ def _fts_rows(connection: sqlite3.Connection, fts_query: str,
         return []
 
 
+def _seg_fts_rows(connection: sqlite3.Connection, tokens: list[str],
+                  paper_id: Optional[int], limit: int) -> list[sqlite3.Row]:
+    """BM25 over the segmented index (real ranking for Chinese queries)."""
+    if not tokens:
+        return []
+    escaped = [token.replace('"', '""') for token in tokens]
+    seg_query = " OR ".join(f'"{token}"' for token in escaped)
+    clause = "AND c.paper_id = ?" if paper_id is not None else ""
+    params: list[Any] = [seg_query]
+    if paper_id is not None:
+        params.append(paper_id)
+    try:
+        return connection.execute(
+            "SELECT c.id, c.paper_id, c.page_id, c.chunk_index, c.text, c.section, c.heading, "
+            "c.x0, c.y0, c.x1, c.y1, p.page_number, papers.title AS paper_title "
+            "FROM chunks_fts_seg JOIN chunks c ON chunks_fts_seg.rowid = c.id "
+            "JOIN pages p ON p.id = c.page_id JOIN papers ON papers.id = c.paper_id "
+            f"WHERE chunks_fts_seg MATCH ? {clause} "
+            "ORDER BY bm25(chunks_fts_seg), p.page_number, c.chunk_index LIMIT ?",
+            [*params, limit],
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
 def _like_rows(connection: sqlite3.Connection, terms: list[str],
                paper_id: Optional[int], limit: int) -> list[sqlite3.Row]:
     if not terms:
@@ -133,6 +160,7 @@ def keyword_search(query: str, db_path: Path | str, paper_id: Optional[int] = No
     all_terms = [query, *expansions]
     fts_tokens = _dedupe(TOKEN_RE.findall(" ".join(all_terms)))
     fts_query = " OR ".join(f'"{token}"' for token in fts_tokens) if fts_tokens else ""
+    seg_tokens = _dedupe(tokenization.tokenize(" ".join(all_terms)))
 
     like_terms: list[str] = []
     if _has_cjk(query):
@@ -143,11 +171,15 @@ def keyword_search(query: str, db_path: Path | str, paper_id: Optional[int] = No
     connection = connect(db_path)
     try:
         fts_rows = _fts_rows(connection, fts_query, paper_id, limit) if fts_query else []
+        seg_rows = _seg_fts_rows(connection, seg_tokens, paper_id, limit)
         like_rows = _like_rows(connection, like_terms, paper_id, limit) if like_terms else []
     finally:
         connection.close()
 
-    ordered = (like_rows + fts_rows) if _has_cjk(query) else (fts_rows + like_rows)
+    if _has_cjk(query):
+        ordered = seg_rows + like_rows + fts_rows
+    else:
+        ordered = fts_rows + seg_rows + like_rows
     results: list[dict[str, Any]] = []
     seen: set[int] = set()
     for row in ordered:
@@ -202,6 +234,8 @@ def _row_to_chunk(row: Any, source: str, score: Optional[float] = None) -> dict[
         "id": int(chunk_id) if chunk_id is not None else None,
         "chunk_id": int(chunk_id) if chunk_id is not None else None,
         "paper_id": int(get("paper_id")) if get("paper_id") is not None else None,
+        "page_id": int(get("page_id")) if get("page_id") is not None else None,
+        "chunk_index": int(get("chunk_index")) if get("chunk_index") is not None else None,
         "page_number": int(get("page_number")) if get("page_number") is not None else None,
         "text": get("text") or "",
         "section": get("section") or "",
@@ -219,6 +253,7 @@ def rrf_fuse(result_lists: Iterable[tuple[str, list[dict[str, Any]]]],
     """Fuse ranked lists by reciprocal rank, deduplicating by chunk id."""
     weights = weights or {}
     merged: dict[int, dict[str, Any]] = {}
+    text_keys: dict[tuple[Any, str], int] = {}
     for source, rows in result_lists:
         weight = weights.get(source, 1.0)
         for rank, row in enumerate(rows, start=1):
@@ -226,12 +261,19 @@ def rrf_fuse(result_lists: Iterable[tuple[str, list[dict[str, Any]]]],
             if chunk_id is None:
                 continue
             contribution = weight / (k + rank)
-            current = merged.get(chunk_id)
+            normalized = re.sub(r"\s+", "", str(row.get("text") or "").lower())[:400]
+            text_key = (row.get("paper_id"), normalized) if len(normalized) >= 40 else None
+            if text_key is not None and text_key in text_keys:
+                current = merged[text_keys[text_key]]
+            else:
+                current = merged.get(chunk_id)
             if current is None:
                 current = dict(row)
                 current["score"] = 0.0
                 current["sources"] = []
                 merged[chunk_id] = current
+                if text_key is not None:
+                    text_keys[text_key] = chunk_id
             current["score"] = float(current.get("score") or 0.0) + contribution
             if source not in current["sources"]:
                 current["sources"].append(source)
@@ -258,21 +300,112 @@ def _canonical_chunks(db_path: Path | str, chunk_ids: list[int]) -> dict[int, di
     return {int(row["id"]): _row_to_chunk(row, source="canonical") for row in rows}
 
 
+def _retrieval_options(db_path: Path | str) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "rerank_enabled": True,
+        "rerank_engine": "lexical",
+        "rerank_model": "",
+        "relevance_min_coverage": 0.0,
+    }
+    try:
+        connection = connect(db_path)
+        try:
+            rows = connection.execute(
+                "SELECT key, value FROM settings WHERE key IN "
+                "('rerank_enabled','rerank_engine','rerank_model','relevance_min_coverage')"
+            ).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return options
+    values = {row["key"]: row["value"] for row in rows}
+    if "rerank_enabled" in values:
+        options["rerank_enabled"] = values["rerank_enabled"].strip().lower() not in {
+            "0", "false", "no", "off"}
+    options["rerank_engine"] = values.get("rerank_engine", "").strip() or "lexical"
+    options["rerank_model"] = values.get("rerank_model", "").strip()
+    try:
+        options["relevance_min_coverage"] = float(values.get("relevance_min_coverage") or 0.0)
+    except ValueError:
+        options["relevance_min_coverage"] = 0.0
+    return options
+
+
+def _neighbor_context(connection: sqlite3.Connection, rows: list[dict[str, Any]],
+                      max_chars: int = 2400) -> None:
+    """Small-to-big: attach the same-page neighbouring chunks to each hit."""
+    for row in rows:
+        row["context_text"] = str(row.get("text") or "")
+        row["context_chunk_ids"] = [row.get("id")] if row.get("id") is not None else []
+        paper_id = row.get("paper_id")
+        page_id = row.get("page_id")
+        chunk_index = row.get("chunk_index")
+        if paper_id is None or page_id is None or chunk_index is None:
+            continue
+        try:
+            neighbours = connection.execute(
+                "SELECT id, text FROM chunks WHERE paper_id=? AND page_id=? "
+                "AND chunk_index BETWEEN ? AND ? ORDER BY chunk_index",
+                (int(paper_id), int(page_id), int(chunk_index) - 1, int(chunk_index) + 1),
+            ).fetchall()
+        except sqlite3.Error:
+            continue
+        if len(neighbours) <= 1:
+            continue
+        pieces: list[str] = []
+        used = 0
+        for neighbour in neighbours:
+            text = str(neighbour["text"] or "").strip()
+            if not text:
+                continue
+            if used + len(text) > max_chars and pieces:
+                break
+            pieces.append(text)
+            used += len(text) + 1
+        row["context_text"] = " ".join(pieces)[:max_chars]
+        row["context_chunk_ids"] = [int(item["id"]) for item in neighbours]
+
+
+def _coverage(query: str, row: dict[str, Any]) -> float:
+    query_terms = tokenization.terms(query)
+    if not query_terms:
+        return 0.0
+    row_terms = tokenization.terms(" ".join(str(row.get(key) or "") for key in
+                                           ("heading", "section", "text")))
+    return len(query_terms & row_terms) / len(query_terms)
+
+
 def hybrid_search(query: str, db_path: Path | str, vectors_dir: Path | str,
                   paper_id: Optional[int] = None, top_k: int = 8, candidate_k: int = 30,
                   api_key: Optional[str] = None, embedding_model: Optional[str] = None,
-                  enable_vectors: bool = True) -> list[dict[str, Any]]:
-    """Return the best chunks from both indexes, fused and provenance-enriched."""
+                  enable_vectors: bool = True,
+                  rerank_engine: Optional[str] = None,
+                  rerank_model: Optional[str] = None,
+                  rerank_enabled: Optional[bool] = None,
+                  min_coverage: Optional[float] = None,
+                  expand_neighbors: bool = True) -> list[dict[str, Any]]:
+    """Return the best chunks from both indexes, fused, reranked and enriched."""
     query = query.strip()
     if not query:
         return []
+    options = _retrieval_options(db_path)
+    if rerank_engine is None:
+        rerank_engine = str(options["rerank_engine"])
+    if rerank_model is None:
+        rerank_model = str(options["rerank_model"])
+    if rerank_enabled is None:
+        rerank_enabled = bool(options["rerank_enabled"])
+    if min_coverage is None:
+        min_coverage = float(options["relevance_min_coverage"])
+
     keyword_rows = keyword_search(query, db_path, paper_id, candidate_k)
     vector_rows = vector_search(
         query, db_path, vectors_dir, paper_id, candidate_k,
         api_key=api_key, embedding_model=embedding_model, enable_vectors=enable_vectors,
     )
     fused = rrf_fuse([("vector", vector_rows), ("keyword", keyword_rows)],
-                     weights={"vector": 1.0, "keyword": 0.9})[:top_k]
+                     weights={"vector": 1.0, "keyword": 0.9})
+    fused = fused[:max(candidate_k, top_k)]
     canonical = _canonical_chunks(db_path, [row["id"] for row in fused if row.get("id")])
     results: list[dict[str, Any]] = []
     for row in fused:
@@ -284,7 +417,33 @@ def hybrid_search(query: str, db_path: Path | str, vectors_dir: Path | str,
         if row.get("distance") is not None:
             canonical_row["distance"] = row["distance"]
         results.append(canonical_row)
-    return results
+
+    if expand_neighbors and results:
+        connection = connect(db_path)
+        try:
+            _neighbor_context(connection, results)
+        finally:
+            connection.close()
+
+    if rerank_enabled and results:
+        results = rerank_module.rerank(query, results, max(candidate_k, top_k),
+                                       engine=rerank_engine, model=rerank_model)
+
+    if min_coverage and min_coverage > 0:
+        gated: list[dict[str, Any]] = []
+        for row in results:
+            if _coverage(query, row) >= min_coverage:
+                gated.append(row)
+                continue
+            distance = row.get("distance")
+            try:
+                if distance is not None and float(distance) <= 0.9:
+                    gated.append(row)
+            except (TypeError, ValueError):
+                continue
+        results = gated
+
+    return results[:top_k]
 
 
 def library_search(query: str, db_path: Path | str, vectors_dir: Path | str,
@@ -369,7 +528,7 @@ def build_context(rows: list[dict[str, Any]], max_chars: int = 30000,
             continue
         if chunk_id is not None:
             seen.add(int(chunk_id))
-        text = (row.get("text") or "").strip()
+        text = (row.get("context_text") or row.get("text") or "").strip()
         if not text:
             continue
         header = f"[Paper: {row.get('paper_title') or '未命名'}] [Page {row.get('page_number')}] {row.get('section') or row.get('heading') or '正文'}"

@@ -15,6 +15,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
+from . import ocr as ocr_module
 from .agent import AgentConfig, AgentError, AgentRunner
 from .credentials import CredentialError, key_store as _credential_key_store, safe_key
 from .embedding import DEFAULT_EMBED_MODEL, delete_paper_vectors
@@ -112,6 +113,21 @@ def _progress_callback(paper_id: int):
     return report
 
 
+def _ocr_options() -> dict[str, Any]:
+    """Read local OCR settings without letting a bad value abort an import."""
+    enabled = _setting("ocr_enabled", "true").lower() not in {"0", "false", "no", "off"}
+    try:
+        dpi = int(_setting("ocr_dpi", str(ocr_module.DEFAULT_DPI)))
+    except ValueError:
+        dpi = ocr_module.DEFAULT_DPI
+    return {
+        "enable_ocr": enabled,
+        "ocr_engine": _setting("ocr_engine", "auto"),
+        "ocr_lang": _setting("ocr_lang", ocr_module.DEFAULT_LANG),
+        "ocr_dpi": max(72, min(dpi, 600)),
+    }
+
+
 def _run_import_job(paper_id: int, stored_path: str) -> None:
     try:
         _set_progress(paper_id, "parsing", status="processing", error=None)
@@ -123,6 +139,7 @@ def _run_import_job(paper_id: int, stored_path: str) -> None:
                 paper_id, document, DB_PATH, VECTORS_DIR,
                 embedding_key=_safe_qwen_key(), embedding_model=_embedding_model(),
                 progress=_progress_callback(paper_id),
+                **_ocr_options(),
             )
         finally:
             document.close()
@@ -846,6 +863,14 @@ def paper_file(paper_id: int):
     return FileResponse(paper["stored_path"], media_type="application/pdf", filename=paper["file_name"])
 
 
+def _ocr_available(engine_name: str) -> str:
+    """Return the resolved local OCR engine name, or ``"none"``."""
+    try:
+        return ocr_module.get_engine(engine_name).name
+    except Exception:
+        return "none"
+
+
 def _settings_payload(values: dict[str, str]) -> dict[str, Any]:
     provider = values.get("provider", "").lower().strip()
     spec = providers.PROVIDERS.get(provider)
@@ -871,6 +896,11 @@ def _settings_payload(values: dict[str, str]) -> dict[str, Any]:
         "default_model": spec.default_model if spec else "",
         "embedding_provider": "qwen",
         "embedding_model": values.get("embedding_model", DEFAULT_EMBED_MODEL),
+        "ocr_enabled": values.get("ocr_enabled", "true"),
+        "ocr_engine": values.get("ocr_engine", "auto"),
+        "ocr_lang": values.get("ocr_lang", ocr_module.DEFAULT_LANG),
+        "ocr_dpi": values.get("ocr_dpi", str(ocr_module.DEFAULT_DPI)),
+        "ocr_available": _ocr_available(values.get("ocr_engine", "auto")),
         "api_key_configured": bool(safe_key(provider)) if spec else False,
         "embedding_key_configured": bool(safe_key("qwen")),
         "providers": providers.public_catalog(),
@@ -917,6 +947,10 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
         "model": model,
         "embedding_model": embedding_model,
     }
+    # Optional local-pipeline settings are only written when supplied.
+    for key in ("ocr_enabled", "ocr_engine", "ocr_lang", "ocr_dpi"):
+        if key in payload and str(payload[key]).strip():
+            values[key] = str(payload[key]).strip()
     for key, value in values.items():
         if len(key) > 100 or len(value) > 10000:
             raise HTTPException(400, "设置键或值过长")

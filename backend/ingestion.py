@@ -12,6 +12,7 @@ from typing import Any, Callable, Optional
 
 import fitz
 
+from . import ocr as ocr_module
 from .embedding import (
     DEFAULT_EMBED_MODEL,
     delete_paper_vectors,
@@ -88,17 +89,29 @@ def _table_to_markdown(rows: list[list[Any]]) -> str:
 
 
 def _page_tables(page) -> list[dict[str, Any]]:
+    """Extract tables, falling back to text alignment for borderless tables."""
+    found: list[Any] = []
+    for strategy in ("lines", "text"):
+        try:
+            if strategy == "lines":
+                found = list(page.find_tables().tables)
+            else:
+                found = list(page.find_tables(strategy="text").tables)
+        except Exception:
+            found = []
+        if found:
+            break
     tables: list[dict[str, Any]] = []
-    try:
-        for table in page.find_tables().tables:
+    for table in found:
+        try:
             md = _table_to_markdown(table.extract())
-            if not md:
-                continue
-            bbox = table.bbox
-            tables.append({"x0": float(bbox[0]), "y0": float(bbox[1]),
-                           "x1": float(bbox[2]), "y1": float(bbox[3]), "text": md})
-    except Exception:
-        pass  # table detection is best-effort; a single bad page must not break import
+        except Exception:
+            continue
+        if not md:
+            continue
+        bbox = table.bbox
+        tables.append({"x0": float(bbox[0]), "y0": float(bbox[1]),
+                       "x1": float(bbox[2]), "y1": float(bbox[3]), "text": md})
     return tables
 
 
@@ -182,6 +195,37 @@ def extract_page(page, page_number: int) -> tuple[str, list[dict[str, Any]]]:
     return "\n\n".join(parts), chunks
 
 
+def _ocr_chunks(text: str, page_width: float, page_height: float,
+                max_len: int = 1200) -> list[dict[str, Any]]:
+    """Turn OCR output into provenance-preserving chunks.
+
+    OCR has no per-line boxes we can trust, so all chunks share the page rect.
+    Headings are still detected from the text so section-aware tools keep
+    working on scanned papers.
+    """
+    chunks: list[dict[str, Any]] = []
+    section = ""
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text or "") if part.strip()]
+    for paragraph in paragraphs:
+        lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
+        if not lines:
+            continue
+        first = lines[0]
+        heading = first if len(first) <= 150 and (
+            HEADING_RE.match(first) or CHINESE_HEADING_RE.match(first)
+        ) else ""
+        if heading:
+            section = heading
+            chunks.extend(_split_text(heading, 0.0, 0.0, page_width, page_height,
+                                      section, heading, max_len=max_len))
+            lines = lines[1:]
+        body = " ".join(lines).strip()
+        if body:
+            chunks.extend(_split_text(body, 0.0, 0.0, page_width, page_height,
+                                      section, "", max_len=max_len))
+    return chunks
+
+
 def _setting(connection: sqlite3.Connection, key: str, default: str) -> str:
     row = connection.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     value = row["value"].strip() if row and row["value"].strip() else ""
@@ -206,12 +250,33 @@ def _report(progress: Optional[ProgressCallback], stage: str, current: int, tota
 def process_document(paper_id: int, document, db_path: Path | str,
                      vectors_dir: Path | str, embedding_key: Optional[str] = None,
                      embedding_model: Optional[str] = None,
-                     progress: Optional[ProgressCallback] = None) -> dict[str, Any]:
-    """Re-parse a document into pages/chunks/vectors and mark it ready."""
+                     progress: Optional[ProgressCallback] = None,
+                     ocr_engine: Optional[Any] = None,
+                     ocr_lang: str = ocr_module.DEFAULT_LANG,
+                     ocr_dpi: int = ocr_module.DEFAULT_DPI,
+                     ocr_min_chars: int = ocr_module.MIN_PAGE_CHARS,
+                     enable_ocr: bool = True) -> dict[str, Any]:
+    """Re-parse a document into pages/chunks/vectors and mark it ready.
+
+    Pages without a usable text layer are rendered and passed to a local OCR
+    engine.  When no engine is installed the page stays marked ``needs_ocr``
+    but the import still succeeds.
+    """
     _safe_delete_vectors(vectors_dir, paper_id)
     chunk_rows: list[dict[str, Any]] = []
     total_chars = 0
     page_count = len(document)
+    engine = None
+    if enable_ocr:
+        try:
+            if isinstance(ocr_engine, str):
+                engine = ocr_module.get_engine(ocr_engine)
+            else:
+                engine = ocr_engine or ocr_module.get_engine()
+        except ocr_module.OcrError:
+            engine = None
+    ocr_pages = 0
+    ocr_errors: list[str] = []
     with get_connection(db_path) as connection:
         # Delete chunks explicitly (not via cascade) so the FTS cleanup trigger fires.
         connection.execute("DELETE FROM chunks WHERE paper_id=?", (paper_id,))
@@ -219,12 +284,30 @@ def process_document(paper_id: int, document, db_path: Path | str,
         connection.commit()
         for page_number, page in enumerate(document, start=1):
             full_text, chunks = extract_page(page, page_number)
+            used_ocr = False
+            if engine is not None and engine.available() and len(full_text.strip()) < ocr_min_chars:
+                _report(progress, "ocr", page_number, page_count)
+                try:
+                    ocr_text = ocr_module.ocr_page(page, engine, ocr_lang, ocr_dpi)
+                except Exception as error:  # OCR is best-effort per page
+                    ocr_errors.append(f"第 {page_number} 页 OCR 失败：{error}")
+                else:
+                    if ocr_text.strip():
+                        full_text = ocr_text
+                        chunks = _ocr_chunks(ocr_text, float(page.rect.width or 612.0),
+                                             float(page.rect.height or 792.0))
+                        used_ocr = True
+                        ocr_pages += 1
             total_chars += len(full_text)
             page_id = connection.execute(
                 "INSERT INTO pages(paper_id, page_number, text) VALUES (?, ?, ?)",
                 (paper_id, page_number, full_text),
             ).lastrowid
-            for block in page.get_text("blocks"):
+            blocks = list(page.get_text("blocks"))
+            if used_ocr:
+                blocks = [(0.0, 0.0, float(page.rect.width or 612.0),
+                           float(page.rect.height or 792.0), full_text)]
+            for block in blocks:
                 if len(block) >= 5 and str(block[4]).strip():
                     connection.execute(
                         "INSERT INTO page_text_blocks(page_id, x0, y0, x1, y1, text) VALUES (?, ?, ?, ?, ?, ?)",
@@ -272,6 +355,7 @@ def process_document(paper_id: int, document, db_path: Path | str,
             _report(progress, "embedding_failed", 0, len(chunk_rows))
 
     needs_ocr = 0 if total_chars else 1
+    error_message = embedding_error or ("；".join(ocr_errors[:3]) if ocr_errors else "")
     with get_connection(db_path) as connection:
         connection.execute(
             "UPDATE papers SET page_count=?, status='ready', vectorized=?, needs_ocr=?, "
@@ -279,14 +363,15 @@ def process_document(paper_id: int, document, db_path: Path | str,
             "error_message=? WHERE id=?",
             (page_count, vectorized, needs_ocr, used_model, embedding_dim,
              "ready" if vectorized or not embedding_key else "ready_no_vectors",
-             page_count, page_count, embedding_error or None, paper_id),
+             page_count, page_count, error_message or None, paper_id),
         )
         connection.commit()
     _report(progress, "ready", page_count, page_count)
     return {"paper_id": paper_id, "pages": page_count, "chunks": len(chunk_rows),
             "vectorized": bool(vectorized), "embedding_model": used_model,
             "embedding_dim": embedding_dim, "needs_ocr": bool(needs_ocr),
-            "embedding_error": embedding_error}
+            "ocr_pages": ocr_pages, "ocr_engine": getattr(engine, "name", "none"),
+            "ocr_errors": ocr_errors, "embedding_error": embedding_error}
 
 
 def reindex_document(paper_id: int, db_path: Path | str, vectors_dir: Path | str,

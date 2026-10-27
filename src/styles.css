@@ -78,3 +78,12 @@
 .head-actions button.danger{border-color:#e3bebe;background:#fff;color:#a34040}
 .settings-section{margin:8px 0 -4px;padding-top:16px;border-top:1px solid #e8efeb;font-size:15px;color:#34534a}
 .settings-form input[readonly]{background:#f2f6f4;color:#557168}
+/* App shell: header, notice and sidebar stay fixed; only the main panel scrolls. */
+html,body,#root{height:100%}
+body{overflow:hidden}
+.app{height:100vh;height:100dvh;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+.topbar{flex:0 0 76px}
+.notice{flex:0 0 auto}
+.layout{flex:1;min-height:0;overflow:hidden}
+.nav{min-height:0;overflow:hidden}
+.main{min-height:0;overflow-y:auto;overscroll-behavior:contain}

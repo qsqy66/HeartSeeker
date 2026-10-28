@@ -105,6 +105,7 @@ type AgentDone = {
 };
 type AgentEvent =
   | { type: "start"; mode: string; paper_id?: number | null }
+  | { type: "delta"; text: string }
   | ({ type: "step" } & AgentStep)
   | ({ type: "done" } & AgentDone)
   | { type: "error"; error: string };
@@ -233,6 +234,13 @@ function toolLabel(tool: string): string {
     compare_papers: "对比论文",
     extract_paper: "结构化提取",
     calculate: "计算",
+    clinical_calculator: "临床评分",
+    lookup_ontology: "概念查询",
+    appraise_evidence: "证据评价",
+    evidence_table: "证据表格",
+    remember_note: "保存笔记",
+    recall_notes: "检索笔记",
+    forget_note: "删除笔记",
     finish: "生成回答",
     invalid_json: "修正输出格式",
   };
@@ -385,6 +393,12 @@ function MessageView({
         </div>
       )}
       {message.error && <button className="retry-button" onClick={onRetry}>↻ 重试</button>}
+      {message.role === "assistant" && !message.pending && message.id != null && (
+        <div className="export-links">
+          <a href={`${API}/agent/runs/${message.id}/export?format=md`} download>导出 Markdown</a>
+          <a href={`${API}/agent/runs/${message.id}/export?format=csv`} download>引用 CSV</a>
+        </div>
+      )}
     </div>
   );
 }
@@ -431,6 +445,7 @@ function App() {
   const [libraryQuery, setLibraryQuery] = useState("");
   const [libraryResults, setLibraryResults] = useState<SearchResult[]>([]);
   const [librarySearching, setLibrarySearching] = useState(false);
+  const agentAbort = useRef<AbortController | null>(null);
 
   const loadPapers = async () => {
     try {
@@ -644,6 +659,9 @@ function App() {
     paperId: number | undefined,
     setMessages: Dispatch<SetStateAction<ChatMessage[]>>,
   ) => {
+    agentAbort.current?.abort();
+    const controller = new AbortController();
+    agentAbort.current = controller;
     setMessages((messages) => [...messages, { role: "assistant", content: "", pending: true }]);
     setBusy(true);
     try {
@@ -651,11 +669,17 @@ function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: content, mode, paper_id: paperId, stream: true, retry }),
+        signal: controller.signal,
       });
       if (!response.ok) throw new Error(await readError(response));
       let finished = false;
       await consumeAgentStream(response, (event) => {
-        if (event.type === "step") {
+        if (event.type === "delta") {
+          patchLast(setMessages, (message) => ({
+            ...message,
+            content: message.content + event.text,
+          }));
+        } else if (event.type === "step") {
           patchLast(setMessages, (message) => ({
             ...message,
             trace: [...(message.trace || []), event],
@@ -692,16 +716,31 @@ function App() {
         }));
       }
     } catch (error) {
-      const reason = reasonOf(error);
-      patchLast(setMessages, (message) => ({
-        ...message,
-        content: message.content || `⚠ ${reason}`,
-        error: reason,
-        pending: false,
-      }));
+      if (controller.signal.aborted) {
+        patchLast(setMessages, (message) => ({
+          ...message,
+          content: message.content
+            ? `${message.content}\n\n（已停止生成）`
+            : "已停止生成。",
+          pending: false,
+        }));
+      } else {
+        const reason = reasonOf(error);
+        patchLast(setMessages, (message) => ({
+          ...message,
+          content: message.content || `⚠ ${reason}`,
+          error: reason,
+          pending: false,
+        }));
+      }
     } finally {
+      if (agentAbort.current === controller) agentAbort.current = null;
       setBusy(false);
     }
+  };
+
+  const stopAgent = () => {
+    agentAbort.current?.abort();
   };
 
   const ask = async (event: FormEvent) => {
@@ -844,6 +883,7 @@ function App() {
                 setQuestion={setGeneralQuestion}
                 ask={askGeneral}
                 busy={busy}
+                onStop={stopAgent}
                 onRetry={() => void retryGeneral()}
                 mode={generalMode}
                 setMode={setGeneralMode}
@@ -899,6 +939,7 @@ function App() {
               setQuestion={setQuestion}
               ask={ask}
               busy={busy}
+              onStop={stopAgent}
               onRetry={() => void retryChat()}
               remove={() => void remove()}
               reindex={() => void reindex()}
@@ -917,6 +958,7 @@ function GeneralChat({
   setQuestion,
   ask,
   busy,
+  onStop,
   onRetry,
   mode,
   setMode,
@@ -928,6 +970,7 @@ function GeneralChat({
   setQuestion: (value: string) => void;
   ask: (event: FormEvent) => void;
   busy: boolean;
+  onStop: () => void;
   onRetry: () => void;
   mode: GeneralMode;
   setMode: (mode: GeneralMode) => void;
@@ -975,6 +1018,9 @@ function GeneralChat({
           onChange={(event) => setQuestion(event.target.value)}
           placeholder="问一个医学问题，可连续追问…"
         />
+        {busy && (
+          <button type="button" className="stop-button" onClick={onStop}>停止</button>
+        )}
         <button disabled={busy}>发送</button>
       </form>
     </section>
@@ -1126,6 +1172,7 @@ function Reader({
   setQuestion,
   ask,
   busy,
+  onStop,
   onRetry,
   remove,
   reindex,
@@ -1150,6 +1197,7 @@ function Reader({
   setQuestion: (value: string) => void;
   ask: (event: FormEvent) => void;
   busy: boolean;
+  onStop: () => void;
   onRetry: () => void;
   remove: () => void;
   reindex: () => void;
@@ -1223,6 +1271,7 @@ function Reader({
           ask={ask}
           onJump={onJump}
           busy={busy}
+          onStop={onStop}
           onRetry={onRetry}
         />
       )}
@@ -1401,6 +1450,7 @@ function Chat({
   ask,
   onJump,
   busy,
+  onStop,
   onRetry,
 }: {
   chat: ChatMessage[];
@@ -1409,6 +1459,7 @@ function Chat({
   ask: (event: FormEvent) => void;
   onJump: JumpHandler;
   busy: boolean;
+  onStop: () => void;
   onRetry: () => void;
 }) {
   return (
@@ -1434,6 +1485,9 @@ function Chat({
           onChange={(event) => setQuestion(event.target.value)}
           placeholder="输入关于当前论文的问题…"
         />
+        {busy && (
+          <button type="button" className="stop-button" onClick={onStop}>停止</button>
+        )}
         <button disabled={busy}>发送</button>
       </form>
     </div>

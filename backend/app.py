@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import json
 import logging
 import re
@@ -11,11 +13,11 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 import fitz
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from . import clinical, evidence, ocr as ocr_module, ontology
+from . import clinical, evidence, memory, ocr as ocr_module, ontology
 from .agent import AgentConfig, AgentError, AgentRunner
 from .credentials import CredentialError, key_store as _credential_key_store, safe_key
 from .embedding import DEFAULT_EMBED_MODEL, delete_paper_vectors
@@ -224,6 +226,12 @@ class EvidenceAppraisePayload(BaseModel):
     text: str = ""
     paper_id: Optional[int] = None
     title: str = ""
+
+
+class MemoryPayload(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+    tags: list[str] = Field(default_factory=list)
+    source: str = Field(default="user", max_length=80)
 
 
 def _key_store(provider: str, value: Optional[str] = None) -> Optional[str]:
@@ -639,10 +647,33 @@ def agent_chat(payload: AgentChatPayload):
         mode = "paper"
 
     history = _agent_history(mode, paper_id, payload.retry, message)
+    try:
+        token_budget_value = int(_setting("context_token_budget", "24000"))
+    except ValueError:
+        token_budget_value = 24000
     agent_config = AgentConfig(provider=provider, key=key, model=model, mode=mode,
                                protocol=endpoint.protocol, base_url=endpoint.base_url,
-                               paper_id=paper_id, history=history)
-    runner = AgentRunner(agent_config, DB_PATH, VECTORS_DIR)
+                               paper_id=paper_id, history=history,
+                               max_context_tokens=max(2000, min(token_budget_value, 200000)))
+
+    stream_fn = None
+    if payload.stream:
+        def stream_fn(messages):
+            emitted = False
+            try:
+                for piece in providers.stream(endpoint, key, model, messages,
+                                              temperature=agent_config.temperature):
+                    emitted = True
+                    yield piece
+            except providers.ProviderError:
+                if emitted:
+                    raise
+                # Some OpenAI-compatible servers do not implement SSE; fall
+                # back to a normal completion instead of losing the answer.
+                yield providers.chat(endpoint, key, model, messages,
+                                     temperature=agent_config.temperature)
+
+    runner = AgentRunner(agent_config, DB_PATH, VECTORS_DIR, stream_fn=stream_fn)
 
     if not payload.stream:
         try:
@@ -692,6 +723,120 @@ def get_agent_run(run_id: int) -> dict[str, Any]:
                 item[key] = {}
         step_rows.append(item)
     return {"run": data, "steps": step_rows}
+
+
+def _markdown_cell(value: Any) -> str:
+    text = str(value or "").replace("|", "\\|").replace("\n", " ")
+    return text[:500]
+
+
+@app.get("/api/agent/runs/{run_id}/export")
+def export_agent_run(run_id: int, format: str = "md") -> Response:
+    """Export one run as Markdown, JSON or CSV (citations only)."""
+    with get_connection() as connection:
+        run = connection.execute("SELECT * FROM agent_runs WHERE id=?", (run_id,)).fetchone()
+        if run is None:
+            raise HTTPException(404, "Agent 运行记录不存在")
+        steps = [dict(step) for step in connection.execute(
+            "SELECT step_index,thought,tool,args_json,observation_json,duration_ms "
+            "FROM agent_steps WHERE run_id=? ORDER BY step_index", (run_id,)
+        ).fetchall()]
+    data = dict(run)
+    for key in ("trace_json", "citations_json", "warnings_json"):
+        try:
+            data[key] = json.loads(data[key])
+        except (TypeError, ValueError):
+            data[key] = []
+    fmt = (format or "md").strip().lower()
+    if fmt not in {"md", "markdown", "json", "csv"}:
+        raise HTTPException(400, "format 必须是 md、json 或 csv")
+    filename = f"paper-reader-run-{run_id}"
+
+    if fmt in {"md", "markdown"}:
+        citations = data["citations_json"]
+        lines = [
+            "# Paper Reader 回答", "",
+            f"- 问题：{data['question']}",
+            f"- 模式：{data['mode']}",
+            f"- 模型：{data.get('provider') or '—'} / {data.get('model') or '—'}",
+            f"- 引用核验：{'通过' if data.get('verified') else '未通过'}"
+            f"（{data.get('citation_level') or 'none'}）",
+            f"- 时间：{data.get('created_at') or '—'}", "",
+            "## 回答", "", str(data.get("answer") or ""), "",
+            "## 引用", "",
+            "| 论文 | 页码 | 论断 | 原文 |",
+            "| --- | --- | --- | --- |",
+        ]
+        for item in citations:
+            lines.append(
+                f"| {_markdown_cell(item.get('paper_id'))} "
+                f"| {_markdown_cell(item.get('page'))} "
+                f"| {_markdown_cell(item.get('claim'))} "
+                f"| {_markdown_cell(item.get('quote'))} |"
+            )
+        if data["warnings_json"]:
+            lines.extend(["", "## 警告", ""])
+            lines.extend(f"- {warning}" for warning in data["warnings_json"])
+        if steps:
+            lines.extend(["", "## 执行轨迹", ""])
+            for step in steps:
+                lines.append(f"{step['step_index']}. **{step['tool']}** "
+                             f"({step.get('duration_ms') or 0} ms)")
+                if step.get("thought"):
+                    lines.append(f"   - 思考：{step['thought']}")
+        body = "\n".join(lines) + "\n"
+        return Response(body, media_type="text/markdown; charset=utf-8",
+                        headers={"Content-Disposition":
+                                 f'attachment; filename="{filename}.md"'})
+
+    if fmt == "csv":
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(["paper_id", "page", "claim", "quote", "verified",
+                         "claim_supported", "support_score"])
+        for item in data["citations_json"]:
+            writer.writerow([item.get("paper_id"), item.get("page"),
+                             item.get("claim"), item.get("quote"),
+                             item.get("verified"), item.get("claim_supported"),
+                             item.get("support_score")])
+        return Response("\ufeff" + buffer.getvalue(),
+                        media_type="text/csv; charset=utf-8",
+                        headers={"Content-Disposition":
+                                 f'attachment; filename="{filename}.csv"'})
+
+    payload = {"run": data,
+               "steps": [dict(step) for step in steps]}
+    for step in payload["steps"]:
+        for key in ("args_json", "observation_json"):
+            try:
+                step[key] = json.loads(step[key])
+            except (TypeError, ValueError):
+                step[key] = {}
+    return Response(json.dumps(payload, ensure_ascii=False, indent=2),
+                    media_type="application/json; charset=utf-8",
+                    headers={"Content-Disposition":
+                             f'attachment; filename="{filename}.json"'})
+
+
+@app.get("/api/memory")
+def list_memory(limit: int = 50) -> list[dict[str, Any]]:
+    return memory.list_memories(DB_PATH, limit=limit)
+
+
+@app.post("/api/memory")
+def add_memory(payload: MemoryPayload) -> dict[str, Any]:
+    try:
+        return memory.remember(DB_PATH, payload.text, tags=payload.tags,
+                               source=payload.source or "user")
+    except memory.MemoryError as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@app.delete("/api/memory/{memory_id}")
+def delete_memory(memory_id: int) -> dict[str, Any]:
+    if not memory.forget(DB_PATH, memory_id):
+        raise HTTPException(404, "笔记不存在")
+    return {"id": memory_id, "status": "deleted"}
 
 
 class FeedbackPayload(BaseModel):
@@ -981,6 +1126,7 @@ def _settings_payload(values: dict[str, str]) -> dict[str, Any]:
         "nli_enabled": values.get("nli_enabled", "true"),
         "nli_engine": values.get("nli_engine", "none"),
         "nli_model": values.get("nli_model", ""),
+        "context_token_budget": values.get("context_token_budget", "24000"),
         "api_key_configured": bool(safe_key(provider)) if spec else False,
         "embedding_key_configured": bool(safe_key("qwen")),
         "providers": providers.public_catalog(),
@@ -1030,7 +1176,8 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
     # Optional local-pipeline settings are only written when supplied.
     for key in ("ocr_enabled", "ocr_engine", "ocr_lang", "ocr_dpi",
                 "rerank_enabled", "rerank_engine", "rerank_model",
-                "relevance_min_coverage", "nli_enabled", "nli_engine", "nli_model"):
+                "relevance_min_coverage", "nli_enabled", "nli_engine", "nli_model",
+                "context_token_budget"):
         if key in payload and str(payload[key]).strip() != "":
             values[key] = str(payload[key]).strip()
     for key, value in values.items():

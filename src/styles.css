@@ -15,6 +15,11 @@
 .general-messages{min-height:180px;max-height:460px;overflow:auto}
 .retry-button{margin-top:8px;border:1px solid #bcd6c8;background:#fff;color:#176b57;border-radius:6px;padding:4px 10px;font-weight:700}
 .retry-button:hover{border-color:#72ab93}
+.stop-button{margin-left:8px;border:1px solid #e3bebe;background:#fff;color:#a34040;border-radius:6px;padding:0 14px;font-weight:700}
+.stop-button:hover{border-color:#c98f8f;background:#fdf5f5}
+.export-links{display:flex;gap:10px;margin-top:10px;border-top:1px solid #e4ede8;padding-top:9px;font-size:11px}
+.export-links a{color:#176b57;text-decoration:none;border:1px solid #cfe3d7;background:#f3faf6;border-radius:99px;padding:4px 10px}
+.export-links a:hover{border-color:#72ab93}
 
 /* --- Agentic RAG UI ------------------------------------------------------- */
 .mode-toggle{display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap}

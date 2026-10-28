@@ -1,0 +1,87 @@
+{
+  "description": "Answer-level golden set over eval/corpus.json. expected_facts are substrings (or lists of alternatives) that a correct answer should mention; should_refuse marks unanswerable questions. Not clinical evidence.",
+  "cases": [
+    {
+      "id": "dapa-primary-outcome",
+      "question": "What was the primary outcome of the dapagliflozin trial?",
+      "paper_id": 1,
+      "expected_pages": [1],
+      "expected_facts": ["composite", "worsening heart failure", "cardiovascular death"],
+      "expected_quotes": [
+        "The primary outcome was a composite of worsening heart failure or cardiovascular death."
+      ],
+      "should_refuse": false
+    },
+    {
+      "id": "dapa-sample-size",
+      "question": "How many patients were randomly assigned and what dose was used?",
+      "paper_id": 1,
+      "expected_pages": [2],
+      "expected_facts": ["4744", "10 mg"],
+      "expected_quotes": [
+        "We randomly assigned 4744 patients with heart failure and a reduced ejection fraction to receive dapagliflozin 10 mg once daily or placebo."
+      ],
+      "should_refuse": false
+    },
+    {
+      "id": "dapa-hazard-ratio",
+      "question": "What was the hazard ratio for the primary outcome?",
+      "paper_id": 1,
+      "expected_pages": [3],
+      "expected_facts": ["0.74", "0.65 to 0.85"],
+      "expected_quotes": ["hazard ratio, 0.74; 95% CI, 0.65 to 0.85"],
+      "should_refuse": false
+    },
+    {
+      "id": "exercise-hf-outcome",
+      "question": "运动康复对心力衰竭患者的主要结局是什么？",
+      "paper_id": 2,
+      "expected_pages": [1],
+      "expected_facts": ["心血管死亡", "心力衰竭住院"],
+      "expected_quotes": [
+        "主要结局是心血管死亡或心力衰竭住院的复合终点。"
+      ],
+      "should_refuse": false
+    },
+    {
+      "id": "exercise-hf-sample",
+      "question": "这项运动康复研究纳入了多少患者，随访多久？",
+      "paper_id": 2,
+      "expected_pages": [2],
+      "expected_facts": ["120", "12 个月"],
+      "expected_quotes": [
+        "共纳入 120 名心力衰竭患者，随机分为运动康复组和常规护理组，随访 12 个月。"
+      ],
+      "should_refuse": false
+    },
+    {
+      "id": "metformin-null-result",
+      "question": "Did metformin significantly reduce cardiovascular outcomes?",
+      "paper_id": 3,
+      "expected_pages": [3],
+      "expected_facts": ["did not significantly reduce", "0.92"],
+      "expected_quotes": [
+        "Metformin did not significantly reduce the primary composite cardiovascular outcome (hazard ratio 0.92; 95% CI 0.78 to 1.09)."
+      ],
+      "should_refuse": false
+    },
+    {
+      "id": "unanswerable-children",
+      "question": "What was the effect of dapagliflozin on all-cause mortality in children?",
+      "paper_id": 1,
+      "expected_pages": [],
+      "expected_facts": [],
+      "should_refuse": true,
+      "require_citations": false
+    },
+    {
+      "id": "unanswerable-cancer",
+      "question": "Which cancer screening programme did the exercise trial evaluate?",
+      "paper_id": 2,
+      "expected_pages": [],
+      "expected_facts": [],
+      "should_refuse": true,
+      "require_citations": false
+    }
+  ]
+}

@@ -146,6 +146,19 @@ type Settings = {
   default_model: string;
   embedding_provider: string;
   embedding_model: string;
+  ocr_enabled: string;
+  ocr_engine: string;
+  ocr_lang: string;
+  ocr_dpi: string;
+  ocr_available: string;
+  rerank_enabled: string;
+  rerank_engine: string;
+  rerank_model: string;
+  relevance_min_coverage: string;
+  nli_enabled: string;
+  nli_engine: string;
+  nli_model: string;
+  context_token_budget: string;
   api_key_configured: boolean;
   embedding_key_configured: boolean;
   providers: ProviderInfo[];
@@ -427,6 +440,19 @@ function App() {
     default_model: "",
     embedding_provider: "qwen",
     embedding_model: "text-embedding-v3",
+    ocr_enabled: "true",
+    ocr_engine: "auto",
+    ocr_lang: "chi_sim+eng",
+    ocr_dpi: "220",
+    ocr_available: "",
+    rerank_enabled: "true",
+    rerank_engine: "lexical",
+    rerank_model: "",
+    relevance_min_coverage: "0",
+    nli_enabled: "true",
+    nli_engine: "none",
+    nli_model: "",
+    context_token_budget: "24000",
     api_key_configured: false,
     embedding_key_configured: false,
     providers: [],
@@ -806,6 +832,18 @@ function App() {
           base_url: settings.base_url,
           model: settings.model,
           embedding_model: settings.embedding_model,
+          ocr_enabled: settings.ocr_enabled,
+          ocr_engine: settings.ocr_engine,
+          ocr_lang: settings.ocr_lang,
+          ocr_dpi: settings.ocr_dpi,
+          rerank_enabled: settings.rerank_enabled,
+          rerank_engine: settings.rerank_engine,
+          rerank_model: settings.rerank_model,
+          relevance_min_coverage: settings.relevance_min_coverage,
+          nli_enabled: settings.nli_enabled,
+          nli_engine: settings.nli_engine,
+          nli_model: settings.nli_model,
+          context_token_budget: settings.context_token_budget,
           api_key: apiKey,
           embedding_api_key: embeddingApiKey,
         }),
@@ -1638,6 +1676,130 @@ function SettingsView({
           <small className="field-help">
             嵌入 Key 与问答 Key 分开保存；问答供应商不是 Qwen 时仍需单独配置。
           </small>
+        </label>
+        <h3 className="settings-section">本地处理管线</h3>
+        <label>
+          扫描件 OCR
+          <select
+            value={settings.ocr_enabled || "true"}
+            onChange={(event) => setSettings({ ...settings, ocr_enabled: event.target.value })}
+          >
+            <option value="true">启用</option>
+            <option value="false">关闭</option>
+          </select>
+          <small className="field-help">
+            当前可用引擎：{settings.ocr_available || "未检测"}。未安装引擎时扫描页会标记为 needs_ocr，不影响文字版 PDF。
+          </small>
+        </label>
+        <label>
+          OCR 引擎
+          <select
+            value={settings.ocr_engine || "auto"}
+            onChange={(event) => setSettings({ ...settings, ocr_engine: event.target.value })}
+          >
+            <option value="auto">自动（RapidOCR → Tesseract）</option>
+            <option value="rapidocr">RapidOCR</option>
+            <option value="tesseract">Tesseract</option>
+            <option value="none">不启用</option>
+          </select>
+        </label>
+        <label>
+          OCR 语言
+          <input
+            value={settings.ocr_lang || ""}
+            onChange={(event) => setSettings({ ...settings, ocr_lang: event.target.value })}
+            placeholder="chi_sim+eng"
+          />
+        </label>
+        <label>
+          OCR 渲染 DPI
+          <input
+            type="number"
+            min={72}
+            max={600}
+            value={settings.ocr_dpi || "220"}
+            onChange={(event) => setSettings({ ...settings, ocr_dpi: event.target.value })}
+          />
+          <small className="field-help">仅影响扫描页识别，DPI 越高越慢；建议 200–300。</small>
+        </label>
+        <label>
+          检索重排
+          <select
+            value={settings.rerank_enabled || "true"}
+            onChange={(event) => setSettings({ ...settings, rerank_enabled: event.target.value })}
+          >
+            <option value="true">启用</option>
+            <option value="false">关闭</option>
+          </select>
+        </label>
+        <label>
+          重排引擎
+          <select
+            value={settings.rerank_engine || "lexical"}
+            onChange={(event) => setSettings({ ...settings, rerank_engine: event.target.value })}
+          >
+            <option value="lexical">本地词法（无需模型）</option>
+            <option value="cross-encoder">本地 cross-encoder</option>
+            <option value="none">不重排</option>
+          </select>
+        </label>
+        <label>
+          重排模型
+          <input
+            value={settings.rerank_model || ""}
+            onChange={(event) => setSettings({ ...settings, rerank_model: event.target.value })}
+            placeholder="cross-encoder 时填写，如 BAAI/bge-reranker-v2-m3"
+          />
+          <small className="field-help">模型加载失败会自动退回到本地词法重排，不会中断检索。</small>
+        </label>
+        <label>
+          重排最低词覆盖
+          <input
+            value={settings.relevance_min_coverage || "0"}
+            onChange={(event) => setSettings({ ...settings, relevance_min_coverage: event.target.value })}
+            placeholder="0"
+          />
+          <small className="field-help">0–1；高于该覆盖率的片段才保留，0 表示不过滤。</small>
+        </label>
+        <label>
+          论断蕴含校验（NLI）
+          <select
+            value={settings.nli_enabled || "true"}
+            onChange={(event) => setSettings({ ...settings, nli_enabled: event.target.value })}
+          >
+            <option value="true">启用</option>
+            <option value="false">关闭</option>
+          </select>
+        </label>
+        <label>
+          NLI 引擎
+          <select
+            value={settings.nli_engine || "none"}
+            onChange={(event) => setSettings({ ...settings, nli_engine: event.target.value })}
+          >
+            <option value="none">仅规则校验（默认）</option>
+            <option value="cross-encoder-nli">本地 cross-encoder NLI</option>
+          </select>
+        </label>
+        <label>
+          NLI 模型
+          <input
+            value={settings.nli_model || ""}
+            onChange={(event) => setSettings({ ...settings, nli_model: event.target.value })}
+            placeholder="如 cross-encoder/nli-deberta-v3-base"
+          />
+          <small className="field-help">需要安装 sentence-transformers；不可用时回退到规则校验。</small>
+        </label>
+        <label>
+          上下文 token 预算
+          <input
+            type="number"
+            min={2000}
+            max={200000}
+            value={settings.context_token_budget || "24000"}
+            onChange={(event) => setSettings({ ...settings, context_token_budget: event.target.value })}
+          />
+          <small className="field-help">长对话会按此预算裁剪旧步骤，保留系统提示和原始问题。</small>
         </label>
         <button className="primary" type="submit">保存设置</button>
       </form>

@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
-from . import providers, retrieval, verification
+from . import clinical, evidence, ontology, providers, retrieval, verification
 from .citations import PAGE_RE, citation_footer, validate_citations
 from .safety import MEDICAL_SYSTEM_RULES, apply_safety, assess_question, wrap_untrusted
 
@@ -81,6 +81,19 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": "安全计算器，用于 ARR/RRR/NNT 等换算。只支持数字、括号、+ - * / ** 和 abs/round/min/max。",
         "args": {"expression": "例如 1 / abs(0.20 - 0.10)"},
     },
+    "clinical_calculator": {
+        "description": "计算临床评分（CHA₂DS₂-VASc、HAS-BLED、CURB-65、Wells DVT/PE、CKD-EPI eGFR）。不传 calculator 时列出可用评分及其参数。",
+        "args": {"calculator": "评分 id，如 cha2ds2_vasc",
+                 "inputs": "参数对象，如 {\"age\": 72, \"sex\": \"male\", \"hypertension\": true}"},
+    },
+    "lookup_ontology": {
+        "description": "查询本地医学概念本体：返回中文名、英文别名、ICD-10 编码与相关概念。",
+        "args": {"query": "概念名、缩写或 ICD-10 编码", "limit": "可选，默认 5"},
+    },
+    "appraise_evidence": {
+        "description": "按 GRADE 启发式评价研究证据的确定性（研究设计、偏倚风险、不一致性、间接性、精确性、发表偏倚）。",
+        "args": {"paper_id": "可选，评价本地论文", "text": "可选，直接评价一段研究文本"},
+    },
     "finish": {
         "description": "提交最终回答。citations 必须使用工具返回值中的原文，逐字复制 quote。",
         "args": {
@@ -108,6 +121,8 @@ def _system_prompt(config: AgentConfig) -> str:
 5. quote 必须逐字复制自工具 Observation 中出现的论文原文，不得改写、概括或拼接；找不到原文时不要引用。
 6. 如果证据不足，明确写“现有证据不足”，不要猜测。
 7. 涉及多篇论文时，先 list_papers / search_library，再比较；不要假设论文内容。
+8. 临床评分必须调用 clinical_calculator 计算，不要心算；解释时说明评分只是决策辅助。
+9. 评价证据质量时调用 appraise_evidence，并说明结果是启发式判断；医学缩写或概念不确定时可查 lookup_ontology。
 
 【任务约束】
 {mode_rule}
@@ -207,6 +222,20 @@ def _summarize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         summary["source"] = observation.get("source")
     elif "result" in observation:
         summary["result"] = observation.get("result")
+    elif "matches" in observation:
+        summary["query"] = observation.get("query")
+        summary["matches"] = [
+            {"id": item.get("id"), "term": item.get("term"),
+             "match_score": item.get("match_score")}
+            for item in (observation.get("matches") or [])[:5]
+        ]
+    elif "appraisal" in observation:
+        appraisal = observation.get("appraisal") or {}
+        summary["certainty"] = appraisal.get("certainty")
+        summary["design"] = (appraisal.get("design") or {}).get("type")
+        summary["sample_size"] = appraisal.get("sample_size")
+    elif "calculators" in observation:
+        summary["calculators"] = len(observation.get("calculators") or [])
     elif "papers" in observation:
         summary["papers"] = len(observation.get("papers") or [])
     return summary
@@ -336,11 +365,13 @@ class AgentRunner:
                 row = retrieval.read_page(self.db_path, paper_id, page)
             except LookupError as error:
                 raise ValueError(str(error)) from error
-            evidence = [{"paper_id": paper_id, "page_number": page, "chunk_id": f"page-{paper_id}-{page}",
-                         "text": row["text"], "paper_title": row.get("paper_title", "")}]
-            self._add_evidence(evidence)
+            page_evidence = [{"paper_id": paper_id, "page_number": page,
+                              "chunk_id": f"page-{paper_id}-{page}",
+                              "text": row["text"], "paper_title": row.get("paper_title", "")}]
+            self._add_evidence(page_evidence)
             return {"ok": True, "paper_id": paper_id, "page_number": page,
-                    "paper_title": row.get("paper_title", ""), "text": _clip(row["text"], 8000)}, evidence
+                    "paper_title": row.get("paper_title", ""),
+                    "text": _clip(row["text"], 8000)}, page_evidence
         if tool == "read_section":
             paper_id = self._validate_paper_id(args)
             if paper_id is None:
@@ -397,7 +428,7 @@ class AgentRunner:
                                       self.config.key, self.config.model,
                                       protocol=self.config.protocol,
                                       base_url=self.config.base_url)
-            evidence: list[dict[str, Any]] = []
+            extracted_evidence: list[dict[str, Any]] = []
             for field_value in (analysis.get("fields") or {}).values():
                 for item in field_value.get("evidence") or []:
                     page = item.get("page_number")
@@ -407,10 +438,11 @@ class AgentRunner:
                         page_row = retrieval.read_page(self.db_path, paper_id, int(page))
                     except LookupError:
                         continue
-                    evidence.append({"paper_id": paper_id, "page_number": int(page),
-                                     "chunk_id": f"page-{paper_id}-{page}", "text": page_row["text"],
-                                     "paper_title": page_row.get("paper_title", "")})
-            self._add_evidence(evidence)
+                    extracted_evidence.append({
+                        "paper_id": paper_id, "page_number": int(page),
+                        "chunk_id": f"page-{paper_id}-{page}", "text": page_row["text"],
+                        "paper_title": page_row.get("paper_title", "")})
+            self._add_evidence(extracted_evidence)
             fields = {
                 name: {"value": _clip(value.get("value"), 800),
                        "evidence": [
@@ -420,11 +452,46 @@ class AgentRunner:
                 for name, value in (analysis.get("fields") or {}).items()
             }
             return {"ok": True, "fields": fields, "source": analysis.get("source"),
-                    "cached": analysis.get("cached", False)}, evidence
+                    "cached": analysis.get("cached", False)}, extracted_evidence
         if tool == "calculate":
             expression = str(args.get("expression") or "").strip()
             result = _safe_calculate(expression)
             return {"ok": True, "expression": expression, "result": round(result, 6)}, []
+        if tool == "clinical_calculator":
+            name = str(args.get("calculator") or "").strip()
+            if not name:
+                return {"ok": True, "calculators": clinical.list_calculators()}, []
+            inputs = args.get("inputs") or {}
+            if isinstance(inputs, str):
+                try:
+                    inputs = json.loads(inputs)
+                except json.JSONDecodeError as error:
+                    raise ValueError("inputs 必须是 JSON 对象") from error
+            result = clinical.calculate(name, inputs)
+            return {"ok": True, "calculator": result["calculator"],
+                    "result": result}, []
+        if tool == "lookup_ontology":
+            query = str(args.get("query") or "").strip()
+            if not query:
+                raise ValueError("query 不能为空")
+            try:
+                limit = max(1, min(int(args.get("limit") or 5), 10))
+            except (TypeError, ValueError):
+                limit = 5
+            matches = ontology.lookup(query, limit=limit)
+            return {"ok": True, "query": query,
+                    "version": ontology.get_ontology().version,
+                    "matches": matches}, []
+        if tool == "appraise_evidence":
+            text = str(args.get("text") or "").strip()
+            if text:
+                appraisal = evidence.appraise(text, title=str(args.get("title") or ""))
+            else:
+                paper_id = self._validate_paper_id(args)
+                if paper_id is None:
+                    raise ValueError("appraise_evidence 需要 paper_id 或 text")
+                appraisal = evidence.appraise_paper(paper_id, self.db_path)
+            return {"ok": True, "appraisal": appraisal}, []
         raise ValueError(f"未知工具：{tool}")
 
     # --- finalisation --------------------------------------------------------------

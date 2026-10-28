@@ -15,7 +15,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from . import ocr as ocr_module
+from . import clinical, evidence, ocr as ocr_module, ontology
 from .agent import AgentConfig, AgentError, AgentRunner
 from .credentials import CredentialError, key_store as _credential_key_store, safe_key
 from .embedding import DEFAULT_EMBED_MODEL, delete_paper_vectors
@@ -213,6 +213,17 @@ class ModelsPayload(BaseModel):
     api_key: Optional[str] = None
     protocol: Optional[str] = None
     base_url: Optional[str] = None
+
+
+class ClinicalCalculatePayload(BaseModel):
+    calculator: str
+    inputs: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvidenceAppraisePayload(BaseModel):
+    text: str = ""
+    paper_id: Optional[int] = None
+    title: str = ""
 
 
 def _key_store(provider: str, value: Optional[str] = None) -> Optional[str]:
@@ -508,6 +519,57 @@ def library_search(q: str, top_k: int = 8) -> list[dict[str, Any]]:
     top_k = max(1, min(top_k, 50))
     rows = retrieval.library_search(query, DB_PATH, VECTORS_DIR, top_k=top_k)
     return _search_payload(rows)
+
+
+# --- local medical knowledge ---------------------------------------------------------
+
+@app.get("/api/clinical/calculators")
+def list_clinical_calculators() -> list[dict[str, Any]]:
+    return clinical.list_calculators()
+
+
+@app.post("/api/clinical/calculate")
+def run_clinical_calculator(payload: ClinicalCalculatePayload) -> dict[str, Any]:
+    try:
+        return clinical.calculate(payload.calculator, payload.inputs)
+    except clinical.CalculatorError as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@app.get("/api/ontology/lookup")
+def lookup_medical_ontology(q: str, limit: int = 5) -> dict[str, Any]:
+    query = q.strip()
+    if not query:
+        return {"query": "", "matches": [], "version": ontology.get_ontology().version}
+    try:
+        matches = ontology.lookup(query, limit=max(1, min(limit, 20)))
+    except ontology.OntologyError as error:
+        raise HTTPException(503, str(error)) from error
+    return {"query": query, "matches": matches,
+            "version": ontology.get_ontology().version}
+
+
+@app.get("/api/ontology/stats")
+def ontology_stats() -> dict[str, Any]:
+    try:
+        return ontology.stats()
+    except ontology.OntologyError as error:
+        raise HTTPException(503, str(error)) from error
+
+
+@app.post("/api/evidence/appraise")
+def appraise_evidence(payload: EvidenceAppraisePayload) -> dict[str, Any]:
+    text = payload.text.strip()
+    try:
+        if text:
+            return evidence.appraise(text, title=payload.title)
+        if payload.paper_id is None:
+            raise HTTPException(422, "请提供 text 或 paper_id")
+        return evidence.appraise_paper(payload.paper_id, DB_PATH)
+    except LookupError as error:
+        raise HTTPException(404, str(error)) from error
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
 
 
 def _store_agent_message(mode: str, paper_id: Optional[int], role: str,

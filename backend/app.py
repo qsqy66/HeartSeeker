@@ -426,7 +426,10 @@ def _paper_chat_stream(paper_id: int, provider: str, key: str, model: str, promp
     for page_number in sorted({int(number) for number in re.findall(r"\[Page\s+(\d+)\]", answer)}):
         citations.append({"id": page_number, "page_number": page_number, "text": f"[Page {page_number}]"})
     yield json.dumps({"done": True, "id": cursor.lastrowid, "content": answer,
-                      "citations": citations, "sources": _clean_chunks(retrieved)}, ensure_ascii=False) + "\n"
+                      "citations": citations, "sources": _clean_chunks(retrieved),
+                      "citation_level": "page",
+                      "warnings": ["该对话接口只校验页码，未做逐字引文与论断核验；请优先使用 Agent 问答。"]},
+                     ensure_ascii=False) + "\n"
 
 
 def _general_chat_stream(provider: str, key: str, model: str, prompt: str, question: str = ""):
@@ -913,6 +916,9 @@ def _settings_payload(values: dict[str, str]) -> dict[str, Any]:
         "rerank_engine": values.get("rerank_engine", "lexical"),
         "rerank_model": values.get("rerank_model", ""),
         "relevance_min_coverage": values.get("relevance_min_coverage", "0"),
+        "nli_enabled": values.get("nli_enabled", "true"),
+        "nli_engine": values.get("nli_engine", "none"),
+        "nli_model": values.get("nli_model", ""),
         "api_key_configured": bool(safe_key(provider)) if spec else False,
         "embedding_key_configured": bool(safe_key("qwen")),
         "providers": providers.public_catalog(),
@@ -962,7 +968,7 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
     # Optional local-pipeline settings are only written when supplied.
     for key in ("ocr_enabled", "ocr_engine", "ocr_lang", "ocr_dpi",
                 "rerank_enabled", "rerank_engine", "rerank_model",
-                "relevance_min_coverage"):
+                "relevance_min_coverage", "nli_enabled", "nli_engine", "nli_model"):
         if key in payload and str(payload[key]).strip() != "":
             values[key] = str(payload[key]).strip()
     for key, value in values.items():
@@ -1107,7 +1113,8 @@ def chat(paper_id: int, payload: ChatPayload) -> dict[str, Any]:
         citations.append({"id": page_number, "page_number": page_number, "text": f"[Page {page_number}]"})
     sources = _clean_chunks(retrieved)
     return {"id": cursor.lastrowid, "content": answer, "answer": answer, "provider": provider,
-            "citations": citations, "sources": sources}
+            "citations": citations, "sources": sources, "citation_level": "page",
+            "warnings": ["该对话接口只校验页码，未做逐字引文与论断核验；请优先使用 Agent 问答。"]}
 
 
 @app.get("/api/papers/{paper_id}/chat")

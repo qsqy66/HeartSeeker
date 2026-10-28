@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
-from . import providers, retrieval
+from . import providers, retrieval, verification
 from .citations import PAGE_RE, citation_footer, validate_citations
 from .safety import MEDICAL_SYSTEM_RULES, apply_safety, assess_question, wrap_untrusted
 
@@ -429,6 +429,31 @@ class AgentRunner:
 
     # --- finalisation --------------------------------------------------------------
 
+    def _nli_judge(self) -> Optional[verification.NliJudge]:
+        """Resolve an optional local claim-entailment judge from settings once."""
+        if getattr(self, "_nli_loaded", False):
+            return getattr(self, "_nli", None)
+        self._nli_loaded = True
+        self._nli = None
+        try:
+            connection = retrieval.connect(self.db_path)
+            try:
+                rows = connection.execute(
+                    "SELECT key, value FROM settings WHERE key IN "
+                    "('nli_enabled','nli_engine','nli_model')"
+                ).fetchall()
+            finally:
+                connection.close()
+            values = {row["key"]: row["value"] for row in rows}
+            enabled = values.get("nli_enabled", "true").strip().lower() not in {
+                "0", "false", "no", "off"}
+            if enabled and values.get("nli_engine", "none") not in {"", "none"}:
+                self._nli = verification.get_nli(values.get("nli_engine"),
+                                                 values.get("nli_model", ""))
+        except Exception:
+            self._nli = None
+        return self._nli
+
     def _repair_citations(self, messages: list[dict[str, str]], finish_call: dict[str, Any],
                           validation: Any) -> Optional[dict[str, Any]]:
         invalid = validation.invalid[:5]
@@ -471,9 +496,11 @@ class AgentRunner:
         if not isinstance(raw_citations, list):
             raw_citations = []
         require_citation = self.config.mode == "paper"
+        judge = self._nli_judge()
         validation = validate_citations(
             answer, raw_citations, self.evidence,
             default_paper_id=self.config.paper_id, require_citation=require_citation,
+            nli_judge=judge,
         )
         repaired = False
         if not validation.ok and validation.invalid and not repaired:
@@ -486,7 +513,7 @@ class AgentRunner:
                 validation = validate_citations(
                     answer, repaired_citations if isinstance(repaired_citations, list) else raw_citations,
                     self.evidence, default_paper_id=self.config.paper_id,
-                    require_citation=require_citation,
+                    require_citation=require_citation, nli_judge=judge,
                 )
         warnings = list(validation.warnings)
         verified = validation.ok and (validation.level != "none" or not require_citation)

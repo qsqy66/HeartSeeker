@@ -12,6 +12,8 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
+from . import verification
+
 PAGE_RE = re.compile(r"\[Page\s+(\d+)\]", re.IGNORECASE)
 SPACE_RE = re.compile(r"\s+")
 
@@ -36,6 +38,9 @@ class Citation:
     claim: str = ""
     verified: bool = False
     level: str = "page"  # "quote" | "page"
+    claim_supported: Optional[bool] = None
+    support_score: Optional[float] = None
+    support_judge: str = ""
 
 
 @dataclass
@@ -46,13 +51,21 @@ class ValidationResult:
     missing_pages: list[int] = field(default_factory=list)
     level: str = "none"  # "quote" | "page" | "none"
     warnings: list[str] = field(default_factory=list)
+    unsupported_claims: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dicts(self) -> list[dict[str, Any]]:
         return [
             {"page": item.page, "paper_id": item.paper_id, "quote": item.quote,
-             "claim": item.claim, "verified": item.verified, "level": item.level}
+             "claim": item.claim, "verified": item.verified, "level": item.level,
+             "claim_supported": item.claim_supported,
+             "support_score": item.support_score,
+             "support_judge": item.support_judge}
             for item in self.citations
         ]
+
+    @property
+    def claim_failures(self) -> int:
+        return sum(1 for item in self.citations if item.claim_supported is False)
 
 
 def _evidence_index(evidence: Iterable[dict[str, Any]]) -> dict[tuple[Optional[int], int], list[str]]:
@@ -94,12 +107,14 @@ def _available_pages(pages_by_paper: dict[Optional[int], set[int]],
 def validate_citations(answer: str, raw_citations: Optional[list[dict[str, Any]]],
                        evidence: list[dict[str, Any]],
                        default_paper_id: Optional[int] = None,
-                       require_citation: bool = False) -> ValidationResult:
+                       require_citation: bool = False,
+                       nli_judge: Optional[verification.NliJudge] = None) -> ValidationResult:
     index = _evidence_index(evidence)
     pages_by_paper = _pages_by_paper(index)
     citations: list[Citation] = []
     invalid: list[dict[str, Any]] = []
     missing: list[int] = []
+    unsupported_claims: list[dict[str, Any]] = []
 
     for raw in raw_citations or []:
         if not isinstance(raw, dict):
@@ -149,6 +164,23 @@ def validate_citations(answer: str, raw_citations: Optional[list[dict[str, Any]]
         else:
             citation.verified = True
             citation.level = "page"
+
+        if citation.verified and citation.level == "quote" and claim:
+            support = verification.verify_claim(claim, quote, judge=nli_judge)
+            citation.claim_supported = support.supported
+            citation.support_score = support.score
+            citation.support_judge = support.judge
+            failure = {
+                "page": page, "paper_id": paper_id, "claim": claim, "quote": quote,
+                "reason": "；".join(support.reasons) or "论断未得到引文支持",
+                "score": round(support.score, 4),
+            }
+            if support.contradiction:
+                invalid.append({**failure, "reason": "论断与引文不一致：" + failure["reason"]})
+                unsupported_claims.append(failure)
+            elif support.supported is False:
+                unsupported_claims.append(failure)
+
         citations.append(citation)
 
     if not citations:
@@ -175,10 +207,12 @@ def validate_citations(answer: str, raw_citations: Optional[list[dict[str, Any]]
         warnings.append("回答没有可核验的论文引用。")
     if invalid:
         warnings.append("部分引用未能通过原文核验，已标记。")
+    if unsupported_claims:
+        warnings.append(f"{len(unsupported_claims)} 条引用的论断支持度不足，建议核对原文。")
 
     return ValidationResult(ok=ok, citations=citations, invalid=invalid,
                             missing_pages=sorted(set(missing)), level=level,
-                            warnings=warnings)
+                            warnings=warnings, unsupported_claims=unsupported_claims)
 
 
 def citation_footer(citations: list[Citation], include_quote: bool = True) -> str:

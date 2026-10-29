@@ -154,6 +154,8 @@ type Settings = {
   rerank_enabled: string;
   rerank_engine: string;
   rerank_model: string;
+  rerank_base_url: string;
+  rerank_key_configured: boolean;
   relevance_min_coverage: string;
   nli_enabled: string;
   nli_engine: string;
@@ -448,6 +450,8 @@ function App() {
     rerank_enabled: "true",
     rerank_engine: "lexical",
     rerank_model: "",
+    rerank_base_url: "https://cn-beijing.maas.qianwenaiapi.com/api/v1/services/rerank/text-rerank/text-rerank",
+    rerank_key_configured: false,
     relevance_min_coverage: "0",
     nli_enabled: "true",
     nli_engine: "none",
@@ -461,6 +465,7 @@ function App() {
   });
   const [apiKey, setApiKey] = useState("");
   const [embeddingApiKey, setEmbeddingApiKey] = useState("");
+  const [rerankApiKey, setRerankApiKey] = useState("");
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
@@ -839,17 +844,20 @@ function App() {
           rerank_enabled: settings.rerank_enabled,
           rerank_engine: settings.rerank_engine,
           rerank_model: settings.rerank_model,
+          rerank_base_url: settings.rerank_base_url,
           relevance_min_coverage: settings.relevance_min_coverage,
           nli_enabled: settings.nli_enabled,
           nli_engine: settings.nli_engine,
           nli_model: settings.nli_model,
           context_token_budget: settings.context_token_budget,
+          rerank_api_key: rerankApiKey,
           api_key: apiKey,
           embedding_api_key: embeddingApiKey,
         }),
       })));
       setApiKey("");
       setEmbeddingApiKey("");
+      setRerankApiKey("");
       setNotice("模型设置已保存。API Key 仅保存到本机安全存储，不写入日志或数据库。");
     } catch (error) {
       setNotice(`设置保存失败：${reasonOf(error)}`);
@@ -950,6 +958,8 @@ function App() {
               setApiKey={setApiKey}
               embeddingApiKey={embeddingApiKey}
               setEmbeddingApiKey={setEmbeddingApiKey}
+              rerankApiKey={rerankApiKey}
+              setRerankApiKey={setRerankApiKey}
               setSettings={setSettings}
               onSave={saveSettings}
               availableModels={availableModels}
@@ -1538,6 +1548,8 @@ function SettingsView({
   setApiKey,
   embeddingApiKey,
   setEmbeddingApiKey,
+  rerankApiKey,
+  setRerankApiKey,
   setSettings,
   onSave,
   availableModels,
@@ -1548,6 +1560,8 @@ function SettingsView({
   setApiKey: (value: string) => void;
   embeddingApiKey: string;
   setEmbeddingApiKey: (value: string) => void;
+  rerankApiKey: string;
+  setRerankApiKey: (value: string) => void;
   setSettings: (value: Settings) => void;
   onSave: (event: FormEvent) => void;
   availableModels: string[];
@@ -1739,6 +1753,7 @@ function SettingsView({
             onChange={(event) => setSettings({ ...settings, rerank_engine: event.target.value })}
           >
             <option value="lexical">本地词法（无需模型）</option>
+            <option value="qwen">Qwen 远程重排（Qwen3.7）</option>
             <option value="cross-encoder">本地 cross-encoder</option>
             <option value="none">不重排</option>
           </select>
@@ -1748,9 +1763,34 @@ function SettingsView({
           <input
             value={settings.rerank_model || ""}
             onChange={(event) => setSettings({ ...settings, rerank_model: event.target.value })}
-            placeholder="cross-encoder 时填写，如 BAAI/bge-reranker-v2-m3"
+            placeholder="qwen3.7-text-rerank 或 BAAI/bge-reranker-v2-m3"
           />
-          <small className="field-help">模型加载失败会自动退回到本地词法重排，不会中断检索。</small>
+          <small className="field-help">
+            Qwen 重排留空时默认 qwen3.7-text-rerank；本地 cross-encoder 需填写模型名。模型加载或调用失败会自动退回本地词法重排。
+          </small>
+        </label>
+        <label>
+          重排 Base URL
+          <input
+            value={settings.rerank_base_url || ""}
+            onChange={(event) => setSettings({ ...settings, rerank_base_url: event.target.value })}
+            placeholder="https://.../api/v1/services/rerank/text-rerank/text-rerank"
+          />
+          <small className="field-help">仅 Qwen 远程重排使用；留空使用默认地址。</small>
+        </label>
+        <label>
+          重排 API Key
+          <input
+            type="password"
+            value={rerankApiKey}
+            onChange={(event) => setRerankApiKey(event.target.value)}
+            placeholder={settings.rerank_key_configured
+              ? "已配置（输入新 Key 可替换）"
+              : "Qwen 重排服务的 Bearer Key"}
+          />
+          <small className="field-help">
+            单独保存在系统凭据库；留空时依次尝试千问嵌入 Key 和 DASHSCOPE_API_KEY。
+          </small>
         </label>
         <label>
           重排最低词覆盖

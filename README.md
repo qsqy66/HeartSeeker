@@ -44,7 +44,7 @@
 - 中文分词：优先使用 jieba，未安装时退化为 bigram；FTS5 索引使用分词后的文本，兼顾中英文查询。
 - 英文医学缩写与中文词表双向扩展（MI / myocardial infarction / 心梗，HF / heart failure / 心衰……）。
 - 中文问题额外做疑问词切分与短 n-gram 回退，解决 FTS5 对中文不分词、整句 LIKE 匹配不到的问题。
-- 可插拔重排：默认本地词法重排（无需模型），可切换本地 cross-encoder；模型加载或推理失败时自动退回词法重排，不中断检索。
+- 可插拔重排：默认本地词法重排（无需模型），可切换本地 cross-encoder 或 Qwen 远程重排（默认 `qwen3.7-text-rerank`，Base URL、模型和 Key 均可在设置页填写）；调用失败时自动退回词法重排，不中断检索。
 - 支持单篇论文检索、全库检索、按章节阅读和跨论文对比；父子块上下文可扩展到同章节相邻片段。
 
 ### 医学安全与结构化精读
@@ -143,11 +143,21 @@ npm run dev
 5. **通用对话**：首页 AI 学习助手。有论文时可切换「论文库检索」或「通用医学知识」。
 6. **结构化精读**：查看带原文证据的字段；「刷新精读」会调用当前问答模型重新提取。
 
+### Qwen 远程重排配置
+
+设置与隐私 → 本地处理管线 → 重排引擎选择「Qwen 远程重排」，然后填写：
+
+- **重排模型**：默认 `qwen3.7-text-rerank`，留空也会使用该默认值。
+- **重排 Base URL**：默认 `https://cn-beijing.maas.qianwenaiapi.com/api/v1/services/rerank/text-rerank/text-rerank`，可替换为其他兼容地址。
+- **重排 API Key**：单独保存在系统凭据库；留空时依次尝试千问嵌入 Key 和 `DASHSCOPE_API_KEY`。也可用环境变量 `PAPER_READER_RERANK_URL` 覆盖默认地址。
+
+请求按 DashScope 文本重排格式发送 `model / input.query / input.documents / parameters`。未配置 Key、网络不可用或服务报错时，检索自动退回本地词法重排，回答仍会正常生成。
+
 ## 数据与隐私
 
 - 默认数据目录：用户目录下的 `PaperReader`（Windows 为 `%USERPROFILE%\PaperReader`），可用 `PAPER_READER_HOME` 覆盖。
 - 目录内容：`papers/`（原始 PDF）、`database/`（SQLite）、`vectors/`（LanceDB）、`cache/`、`logs/`、`exports/`。
-- 远端调用边界：读取模型列表、结构化精读、Agent 问答会访问所选问答供应商；嵌入计算只会访问 DashScope。只发送问题、必要原文片段和嵌入文本。问答 Key 与嵌入 Key 分别保存在系统凭据库。
+- 远端调用边界：读取模型列表、结构化精读、Agent 问答会访问所选问答供应商；嵌入计算访问 DashScope；启用 Qwen 远程重排时会向配置的重排地址发送查询和候选片段。只发送问题、必要原文片段、嵌入文本和重排候选。问答、嵌入、重排 Key 分别保存在系统凭据库。
 - Agent 运行轨迹、引用、反馈和用户笔记保存在本地 SQLite（`agent_runs`、`agent_steps`、`feedback`、`agent_memories`）。
 
 ## API 一览

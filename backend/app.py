@@ -28,7 +28,7 @@ from .ingestion import (
 )
 from .safety import MEDICAL_SYSTEM_RULES, apply_safety, wrap_untrusted
 from .storage import APP_HOME, DB_PATH, PAPERS_DIR, VECTORS_DIR, get_connection, initialize_storage, utc_now
-from . import providers, retrieval
+from . import providers, rerank, retrieval
 from .structured import extract_fields
 
 
@@ -1122,6 +1122,8 @@ def _settings_payload(values: dict[str, str]) -> dict[str, Any]:
         "rerank_enabled": values.get("rerank_enabled", "true"),
         "rerank_engine": values.get("rerank_engine", "lexical"),
         "rerank_model": values.get("rerank_model", ""),
+        "rerank_base_url": values.get("rerank_base_url", rerank.DEFAULT_QWEN_RERANK_URL),
+        "rerank_key_configured": bool(safe_key(rerank.QWEN_RERANK_KEY) or safe_key("qwen")),
         "relevance_min_coverage": values.get("relevance_min_coverage", "0"),
         "nli_enabled": values.get("nli_enabled", "true"),
         "nli_engine": values.get("nli_engine", "none"),
@@ -1151,6 +1153,7 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
     embedding_model = str(payload.get("embedding_model", "")).strip() or DEFAULT_EMBED_MODEL
     api_key = str(payload.get("api_key", ""))
     embedding_api_key = str(payload.get("embedding_api_key", ""))
+    rerank_api_key = str(payload.get("rerank_api_key", ""))
 
     if provider and provider not in providers.PROVIDERS:
         raise HTTPException(400, "未知的模型供应商")
@@ -1175,7 +1178,7 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
     }
     # Optional local-pipeline settings are only written when supplied.
     for key in ("ocr_enabled", "ocr_engine", "ocr_lang", "ocr_dpi",
-                "rerank_enabled", "rerank_engine", "rerank_model",
+                "rerank_enabled", "rerank_engine", "rerank_model", "rerank_base_url",
                 "relevance_min_coverage", "nli_enabled", "nli_engine", "nli_model",
                 "context_token_budget"):
         if key in payload and str(payload[key]).strip() != "":
@@ -1190,6 +1193,8 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
         _key_store(provider, api_key)
     if embedding_api_key:
         _key_store("qwen", embedding_api_key)
+    if rerank_api_key:
+        _key_store(rerank.QWEN_RERANK_KEY, rerank_api_key)
 
     with get_connection() as connection:
         for key, value in values.items():

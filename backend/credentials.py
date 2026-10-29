@@ -5,6 +5,10 @@ from typing import Optional
 
 from .providers import PROVIDERS
 
+# Non-chat services that still need their own credential slot.  Keeping them
+# out of PROVIDERS means they never appear in the chat-provider picker.
+EXTRA_KEY_SOURCES = {"qwen-rerank", "qwen-nli"}
+
 
 class CredentialError(RuntimeError):
     """The system credential store is unavailable."""
@@ -22,7 +26,7 @@ def key_store(provider: str, value: Optional[str] = None) -> Optional[str]:
     headless machine; only an explicit key operation reports the problem.
     """
     provider = provider.lower().strip()
-    if provider not in PROVIDERS:
+    if provider not in PROVIDERS and provider not in EXTRA_KEY_SOURCES:
         raise CredentialError("未知的模型供应商")
     try:
         import keyring  # type: ignore

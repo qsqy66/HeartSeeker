@@ -305,6 +305,7 @@ def _retrieval_options(db_path: Path | str) -> dict[str, Any]:
         "rerank_enabled": True,
         "rerank_engine": "lexical",
         "rerank_model": "",
+        "rerank_base_url": "",
         "relevance_min_coverage": 0.0,
     }
     try:
@@ -312,7 +313,8 @@ def _retrieval_options(db_path: Path | str) -> dict[str, Any]:
         try:
             rows = connection.execute(
                 "SELECT key, value FROM settings WHERE key IN "
-                "('rerank_enabled','rerank_engine','rerank_model','relevance_min_coverage')"
+                "('rerank_enabled','rerank_engine','rerank_model','rerank_base_url',"
+                "'relevance_min_coverage')"
             ).fetchall()
         finally:
             connection.close()
@@ -324,6 +326,7 @@ def _retrieval_options(db_path: Path | str) -> dict[str, Any]:
             "0", "false", "no", "off"}
     options["rerank_engine"] = values.get("rerank_engine", "").strip() or "lexical"
     options["rerank_model"] = values.get("rerank_model", "").strip()
+    options["rerank_base_url"] = values.get("rerank_base_url", "").strip()
     try:
         options["relevance_min_coverage"] = float(values.get("relevance_min_coverage") or 0.0)
     except ValueError:
@@ -381,6 +384,7 @@ def hybrid_search(query: str, db_path: Path | str, vectors_dir: Path | str,
                   enable_vectors: bool = True,
                   rerank_engine: Optional[str] = None,
                   rerank_model: Optional[str] = None,
+                  rerank_base_url: Optional[str] = None,
                   rerank_enabled: Optional[bool] = None,
                   min_coverage: Optional[float] = None,
                   expand_neighbors: bool = True) -> list[dict[str, Any]]:
@@ -393,6 +397,8 @@ def hybrid_search(query: str, db_path: Path | str, vectors_dir: Path | str,
         rerank_engine = str(options["rerank_engine"])
     if rerank_model is None:
         rerank_model = str(options["rerank_model"])
+    if rerank_base_url is None:
+        rerank_base_url = str(options["rerank_base_url"])
     if rerank_enabled is None:
         rerank_enabled = bool(options["rerank_enabled"])
     if min_coverage is None:
@@ -427,7 +433,8 @@ def hybrid_search(query: str, db_path: Path | str, vectors_dir: Path | str,
 
     if rerank_enabled and results:
         results = rerank_module.rerank(query, results, max(candidate_k, top_k),
-                                       engine=rerank_engine, model=rerank_model)
+                                       engine=rerank_engine, model=rerank_model,
+                                       base_url=rerank_base_url)
 
     if min_coverage and min_coverage > 0:
         gated: list[dict[str, Any]] = []

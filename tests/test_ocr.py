@@ -3,7 +3,9 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -30,6 +32,102 @@ class UnavailableEngine(FakeOcrEngine):
 
     def available(self) -> bool:
         return False
+
+
+class FakeAliyunClient:
+    def __init__(self, body=None, error: Exception | None = None) -> None:
+        self.body = body
+        self.error = error
+        self.request = None
+        self.runtime = None
+
+    def recognize_all_text_with_options(self, request, runtime):
+        self.request = request
+        self.runtime = runtime
+        if self.error is not None:
+            raise self.error
+        return SimpleNamespace(body=self.body)
+
+
+def aliyun_body(content: str = "", blocks: list[str] | None = None):
+    sub_images = [SimpleNamespace(block_info=SimpleNamespace(
+        block_details=[SimpleNamespace(block_content=value) for value in blocks]
+    ))] if blocks is not None else []
+    return SimpleNamespace(code="", message="", data=SimpleNamespace(
+        content=content, sub_images=sub_images))
+
+
+class AliyunOcrEngineTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.image = Path(self.tmp.name) / "page.png"
+        self.image.write_bytes(b"fake-png")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _engine(self, client, **overrides) -> ocr.AliyunOcrEngine:
+        options = {"access_key_id": "LTAI-test", "access_key_secret": "secret",
+                   "client": client}
+        options.update(overrides)
+        return ocr.AliyunOcrEngine(**options)
+
+    def test_sends_body_and_returns_content(self) -> None:
+        client = FakeAliyunClient(aliyun_body(content="第一段\n第二段"))
+        engine = self._engine(client, ocr_type="MultiLang")
+        text = engine.ocr_image(self.image, "chi_sim+eng")
+        self.assertEqual(text, "第一段\n第二段")
+        self.assertEqual(client.request.type, "MultiLang")
+        self.assertEqual(client.request.body.read(), b"fake-png")
+        self.assertIsNone(client.request.url)
+        self.assertEqual(client.runtime.read_timeout, 60000)
+
+    def test_falls_back_to_block_details(self) -> None:
+        client = FakeAliyunClient(aliyun_body(content="", blocks=["标题", "正文内容"]))
+        engine = self._engine(client)
+        self.assertEqual(engine.ocr_image(self.image, ""), "标题\n正文内容")
+
+    def test_rejects_oversized_image_without_calling_service(self) -> None:
+        client = FakeAliyunClient(aliyun_body(content="unused"))
+        engine = self._engine(client)
+        with unittest.mock.patch.object(ocr, "MAX_IMAGE_BYTES", 4):
+            with self.assertRaises(ocr.OcrError):
+                engine.ocr_image(self.image, "")
+        self.assertIsNone(client.request)
+
+    def test_missing_credentials_marks_unavailable(self) -> None:
+        engine = ocr.AliyunOcrEngine(access_key_id="", access_key_secret="",
+                                     client=FakeAliyunClient(aliyun_body()))
+        self.assertFalse(engine.available())
+        with self.assertRaises(ocr.OcrError):
+            engine.ocr_image(self.image, "")
+
+    def test_sdk_error_is_wrapped(self) -> None:
+        error = RuntimeError("InvalidAccessKeyId.NotFound")
+        engine = self._engine(FakeAliyunClient(error=error))
+        with self.assertRaises(ocr.OcrError) as raised:
+            engine.ocr_image(self.image, "")
+        self.assertIn("InvalidAccessKeyId", str(raised.exception))
+        self.assertNotIn("secret", str(raised.exception))
+
+    def test_service_error_code_is_reported(self) -> None:
+        body = SimpleNamespace(code="InvalidImage", message="image format error", data=None)
+        engine = self._engine(FakeAliyunClient(body))
+        with self.assertRaises(ocr.OcrError) as raised:
+            engine.ocr_image(self.image, "")
+        self.assertIn("InvalidImage", str(raised.exception))
+
+    def test_endpoint_normalisation_and_engine_registry(self) -> None:
+        engine = ocr.AliyunOcrEngine(
+            access_key_id="id", access_key_secret="secret",
+            endpoint="https://ocr-api.cn-shanghai.aliyuncs.com/",
+            ocr_type="made-up", client=FakeAliyunClient(aliyun_body()),
+        )
+        self.assertEqual(engine.endpoint, "ocr-api.cn-shanghai.aliyuncs.com")
+        self.assertEqual(engine.ocr_type, ocr.DEFAULT_ALIYUN_OCR_TYPE)
+        registry_engine = ocr.get_engine("aliyun")
+        self.assertIsInstance(registry_engine, ocr.AliyunOcrEngine)
+        self.assertEqual(registry_engine.name, "aliyun")
 
 
 class OcrTestCase(unittest.TestCase):

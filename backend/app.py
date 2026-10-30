@@ -122,9 +122,18 @@ def _ocr_options() -> dict[str, Any]:
         dpi = int(_setting("ocr_dpi", str(ocr_module.DEFAULT_DPI)))
     except ValueError:
         dpi = ocr_module.DEFAULT_DPI
+    engine_name = _setting("ocr_engine", "auto")
+    engine: Any = engine_name
+    if engine_name.strip().lower() == "aliyun":
+        engine = ocr_module.AliyunOcrEngine(
+            access_key_id=_setting("ocr_access_key_id", ""),
+            access_key_secret=safe_key(ocr_module.ALIYUN_OCR_KEY) or "",
+            endpoint=_setting("ocr_endpoint", ocr_module.DEFAULT_ALIYUN_ENDPOINT),
+            ocr_type=_setting("ocr_type", ocr_module.DEFAULT_ALIYUN_OCR_TYPE),
+        )
     return {
         "enable_ocr": enabled,
-        "ocr_engine": _setting("ocr_engine", "auto"),
+        "ocr_engine": engine,
         "ocr_lang": _setting("ocr_lang", ocr_module.DEFAULT_LANG),
         "ocr_dpi": max(72, min(dpi, 600)),
     }
@@ -1081,9 +1090,18 @@ def paper_file(paper_id: int):
     return FileResponse(paper["stored_path"], media_type="application/pdf", filename=paper["file_name"])
 
 
-def _ocr_available(engine_name: str) -> str:
-    """Return the resolved local OCR engine name, or ``"none"``."""
+def _ocr_available(engine_name: str, values: Optional[dict[str, str]] = None) -> str:
+    """Return the resolved OCR engine name, or ``"none"`` when unusable."""
+    values = values or {}
     try:
+        if (engine_name or "").strip().lower() == "aliyun":
+            engine = ocr_module.AliyunOcrEngine(
+                access_key_id=values.get("ocr_access_key_id", ""),
+                access_key_secret=safe_key(ocr_module.ALIYUN_OCR_KEY) or "",
+                endpoint=values.get("ocr_endpoint", ocr_module.DEFAULT_ALIYUN_ENDPOINT),
+                ocr_type=values.get("ocr_type", ocr_module.DEFAULT_ALIYUN_OCR_TYPE),
+            )
+            return engine.name if engine.available() else "none"
         return ocr_module.get_engine(engine_name).name
     except Exception:
         return "none"
@@ -1118,7 +1136,11 @@ def _settings_payload(values: dict[str, str]) -> dict[str, Any]:
         "ocr_engine": values.get("ocr_engine", "auto"),
         "ocr_lang": values.get("ocr_lang", ocr_module.DEFAULT_LANG),
         "ocr_dpi": values.get("ocr_dpi", str(ocr_module.DEFAULT_DPI)),
-        "ocr_available": _ocr_available(values.get("ocr_engine", "auto")),
+        "ocr_endpoint": values.get("ocr_endpoint", ocr_module.DEFAULT_ALIYUN_ENDPOINT),
+        "ocr_type": values.get("ocr_type", ocr_module.DEFAULT_ALIYUN_OCR_TYPE),
+        "ocr_access_key_id": values.get("ocr_access_key_id", ""),
+        "ocr_key_configured": bool(safe_key(ocr_module.ALIYUN_OCR_KEY)),
+        "ocr_available": _ocr_available(values.get("ocr_engine", "auto"), values),
         "rerank_enabled": values.get("rerank_enabled", "true"),
         "rerank_engine": values.get("rerank_engine", "lexical"),
         "rerank_model": values.get("rerank_model", ""),
@@ -1154,6 +1176,7 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
     api_key = str(payload.get("api_key", ""))
     embedding_api_key = str(payload.get("embedding_api_key", ""))
     rerank_api_key = str(payload.get("rerank_api_key", ""))
+    ocr_access_key_secret = str(payload.get("ocr_access_key_secret", ""))
 
     if provider and provider not in providers.PROVIDERS:
         raise HTTPException(400, "未知的模型供应商")
@@ -1178,6 +1201,7 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
     }
     # Optional local-pipeline settings are only written when supplied.
     for key in ("ocr_enabled", "ocr_engine", "ocr_lang", "ocr_dpi",
+                "ocr_endpoint", "ocr_type", "ocr_access_key_id",
                 "rerank_enabled", "rerank_engine", "rerank_model", "rerank_base_url",
                 "relevance_min_coverage", "nli_enabled", "nli_engine", "nli_model",
                 "context_token_budget"):
@@ -1195,6 +1219,8 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
         _key_store("qwen", embedding_api_key)
     if rerank_api_key:
         _key_store(rerank.QWEN_RERANK_KEY, rerank_api_key)
+    if ocr_access_key_secret:
+        _key_store(ocr_module.ALIYUN_OCR_KEY, ocr_access_key_secret)
 
     with get_connection() as connection:
         for key, value in values.items():

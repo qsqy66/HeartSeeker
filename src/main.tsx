@@ -150,6 +150,10 @@ type Settings = {
   ocr_engine: string;
   ocr_lang: string;
   ocr_dpi: string;
+  ocr_endpoint: string;
+  ocr_type: string;
+  ocr_access_key_id: string;
+  ocr_key_configured: boolean;
   ocr_available: string;
   rerank_enabled: string;
   rerank_engine: string;
@@ -446,6 +450,10 @@ function App() {
     ocr_engine: "auto",
     ocr_lang: "chi_sim+eng",
     ocr_dpi: "220",
+    ocr_endpoint: "ocr-api.cn-hangzhou.aliyuncs.com",
+    ocr_type: "Advanced",
+    ocr_access_key_id: "",
+    ocr_key_configured: false,
     ocr_available: "",
     rerank_enabled: "true",
     rerank_engine: "lexical",
@@ -466,6 +474,7 @@ function App() {
   const [apiKey, setApiKey] = useState("");
   const [embeddingApiKey, setEmbeddingApiKey] = useState("");
   const [rerankApiKey, setRerankApiKey] = useState("");
+  const [ocrAccessKeySecret, setOcrAccessKeySecret] = useState("");
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
@@ -841,6 +850,10 @@ function App() {
           ocr_engine: settings.ocr_engine,
           ocr_lang: settings.ocr_lang,
           ocr_dpi: settings.ocr_dpi,
+          ocr_endpoint: settings.ocr_endpoint,
+          ocr_type: settings.ocr_type,
+          ocr_access_key_id: settings.ocr_access_key_id,
+          ocr_access_key_secret: ocrAccessKeySecret,
           rerank_enabled: settings.rerank_enabled,
           rerank_engine: settings.rerank_engine,
           rerank_model: settings.rerank_model,
@@ -858,6 +871,7 @@ function App() {
       setApiKey("");
       setEmbeddingApiKey("");
       setRerankApiKey("");
+      setOcrAccessKeySecret("");
       setNotice("模型设置已保存。API Key 仅保存到本机安全存储，不写入日志或数据库。");
     } catch (error) {
       setNotice(`设置保存失败：${reasonOf(error)}`);
@@ -960,6 +974,8 @@ function App() {
               setEmbeddingApiKey={setEmbeddingApiKey}
               rerankApiKey={rerankApiKey}
               setRerankApiKey={setRerankApiKey}
+              ocrAccessKeySecret={ocrAccessKeySecret}
+              setOcrAccessKeySecret={setOcrAccessKeySecret}
               setSettings={setSettings}
               onSave={saveSettings}
               availableModels={availableModels}
@@ -1550,6 +1566,8 @@ function SettingsView({
   setEmbeddingApiKey,
   rerankApiKey,
   setRerankApiKey,
+  ocrAccessKeySecret,
+  setOcrAccessKeySecret,
   setSettings,
   onSave,
   availableModels,
@@ -1562,6 +1580,8 @@ function SettingsView({
   setEmbeddingApiKey: (value: string) => void;
   rerankApiKey: string;
   setRerankApiKey: (value: string) => void;
+  ocrAccessKeySecret: string;
+  setOcrAccessKeySecret: (value: string) => void;
   setSettings: (value: Settings) => void;
   onSave: (event: FormEvent) => void;
   availableModels: string[];
@@ -1702,7 +1722,7 @@ function SettingsView({
             <option value="false">关闭</option>
           </select>
           <small className="field-help">
-            当前可用引擎：{settings.ocr_available || "未检测"}。未安装引擎时扫描页会标记为 needs_ocr，不影响文字版 PDF。
+            当前可用引擎：{settings.ocr_available || "未检测"}。未安装/未配置引擎时扫描页会标记为 needs_ocr，不影响文字版 PDF。
           </small>
         </label>
         <label>
@@ -1712,10 +1732,14 @@ function SettingsView({
             onChange={(event) => setSettings({ ...settings, ocr_engine: event.target.value })}
           >
             <option value="auto">自动（RapidOCR → Tesseract）</option>
-            <option value="rapidocr">RapidOCR</option>
-            <option value="tesseract">Tesseract</option>
+            <option value="rapidocr">RapidOCR（本地）</option>
+            <option value="tesseract">Tesseract（本地）</option>
+            <option value="aliyun">阿里云 OCR（RecognizeAllText）</option>
             <option value="none">不启用</option>
           </select>
+          <small className="field-help">
+            阿里云 OCR 会把扫描页图像上传到阿里云，按调用量计费；本地方案不产生网络请求。
+          </small>
         </label>
         <label>
           OCR 语言
@@ -1724,6 +1748,7 @@ function SettingsView({
             onChange={(event) => setSettings({ ...settings, ocr_lang: event.target.value })}
             placeholder="chi_sim+eng"
           />
+          <small className="field-help">仅本地 RapidOCR/Tesseract 使用；阿里云 OCR 由识别类型决定语言。</small>
         </label>
         <label>
           OCR 渲染 DPI
@@ -1736,6 +1761,58 @@ function SettingsView({
           />
           <small className="field-help">仅影响扫描页识别，DPI 越高越慢；建议 200–300。</small>
         </label>
+        {settings.ocr_engine === "aliyun" && (
+          <>
+            <label>
+              阿里云 AccessKey ID
+              <input
+                value={settings.ocr_access_key_id || ""}
+                onChange={(event) => setSettings({ ...settings, ocr_access_key_id: event.target.value })}
+                placeholder="LTAI..."
+              />
+              <small className="field-help">
+                RAM 用户需授予 AliyunOCRFullAccess（或 ocr:RecognizeAllText），建议只使用程序访问。
+              </small>
+            </label>
+            <label>
+              阿里云 AccessKey Secret
+              <input
+                type="password"
+                value={ocrAccessKeySecret}
+                onChange={(event) => setOcrAccessKeySecret(event.target.value)}
+                placeholder={settings.ocr_key_configured
+                  ? "已配置（输入新 Secret 可替换）"
+                  : "仅保存在系统凭据库"}
+              />
+              <small className="field-help">
+                Secret 不写入数据库或日志；也可用 ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET 环境变量。
+              </small>
+            </label>
+            <label>
+              阿里云 OCR Endpoint
+              <input
+                value={settings.ocr_endpoint || ""}
+                onChange={(event) => setSettings({ ...settings, ocr_endpoint: event.target.value })}
+                placeholder="ocr-api.cn-hangzhou.aliyuncs.com"
+              />
+              <small className="field-help">按地域选择，例如 ocr-api.cn-shanghai.aliyuncs.com；不要带协议前缀。</small>
+            </label>
+            <label>
+              阿里云 OCR 类型
+              <select
+                value={settings.ocr_type || "Advanced"}
+                onChange={(event) => setSettings({ ...settings, ocr_type: event.target.value })}
+              >
+                <option value="General">General（通用高精度）</option>
+                <option value="Advanced">Advanced（高级识别）</option>
+                <option value="MultiLang">MultiLang（多语言）</option>
+              </select>
+              <small className="field-help">
+                单张图像需小于 10MB、宽高 15–8192 像素且长宽比小于 50；超限页面会自动降低渲染 DPI。
+              </small>
+            </label>
+          </>
+        )}
         <label>
           检索重排
           <select

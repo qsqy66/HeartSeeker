@@ -58,8 +58,11 @@
 ### 本地 OCR（扫描件）
 
 - 页面没有文字层时，可调用本地 OCR：优先 RapidOCR（`rapidocr-onnxruntime`），其次 Tesseract（系统命令或 `TESSERACT_BIN`）。
-- 引擎选择、语言（默认 `chi_sim+eng`）和渲染 DPI（默认 220）可在设置页调整，也可用 `PAPER_READER_OCR_ENGINE` / `PAPER_READER_OCR_LANG` / `PAPER_READER_OCR_DPI` 覆盖。
-- 未安装任何引擎时不会失败：页面保留 `needs_ocr` 标记，文字版 PDF、检索和问答不受影响。
+- 也可选择阿里云 OCR 统一识别（`RecognizeAllText`，SDK：`alibabacloud_ocr_api20210707`）。在设置页填写 AccessKey ID / Secret、Endpoint 和识别类型；Secret 只存入系统凭据库。
+- AccessKey 需为 RAM 用户，授予 `AliyunOCRFullAccess`（或最小权限 `ocr:RecognizeAllText`），建议只使用程序访问并定期轮换。也可用 `ALIBABA_CLOUD_ACCESS_KEY_ID` / `ALIBABA_CLOUD_ACCESS_KEY_SECRET` 环境变量。
+- 阿里云 OCR 会将被识别页面的 PNG 上传到云端并按调用量计费。图像需小于 10MB、宽高 15–8192 像素、长宽比小于 50；超限页面会自动降低渲染 DPI，仍超限则该页记录 OCR 失败。
+- 引擎选择、语言（默认 `chi_sim+eng`）和渲染 DPI（默认 220）可在设置页调整，也可用 `PAPER_READER_OCR_ENGINE` / `PAPER_READER_OCR_LANG` / `PAPER_READER_OCR_DPI` 覆盖；阿里云 Endpoint/类型可用 `PAPER_READER_ALIYUN_OCR_ENDPOINT` / `PAPER_READER_ALIYUN_OCR_TYPE` 覆盖。
+- 未安装或未配置引擎时不会失败：页面保留 `needs_ocr` 标记，文字版 PDF、检索和问答不受影响。
 - OCR 结果进入正常切片和索引流程，后续检索与引用校验与文字版 PDF 一致。
 
 ### 本地医学知识工具
@@ -85,7 +88,7 @@
 | 后端 | FastAPI + PyMuPDF + SQLite(FTS5) + LanceDB |
 | 问答模型 | OpenAI / Anthropic / Gemini 协议及多家 OpenAI 兼容供应商（远端，可选） |
 | 嵌入模型 | Qwen DashScope `text-embedding-v3`（远端计算，向量存本机） |
-| 本地可选模型 | RapidOCR / Tesseract、cross-encoder 重排、cross-encoder NLI（均预留插件接口，缺省回退） |
+| 本地可选模型 | RapidOCR / Tesseract、cross-encoder 重排、cross-encoder NLI（均预留插件接口，缺省回退）；OCR 另可选阿里云 RecognizeAllText |
 | 测试/评测 | Python `unittest` + 检索/引用/答案级 golden set |
 
 > 语义检索和向量问答需要 Qwen（DashScope）Key；其他问答供应商不提供 DashScope 嵌入。没有嵌入 Key 时自动退化为关键词检索，导入、阅读和关键词问答仍可用。OpenAI、Gemini 等也可以用于问答，但不会把各自 Key 发往 DashScope。
@@ -278,7 +281,7 @@ backend/
   verification.py   # 论断级核验与可选本地 NLI
   structured.py     # 结构化字段 LLM 提取、证据校验、缓存
   ingestion.py      # PDF 解析、分栏/表格、切片、向量索引
-  ocr.py            # 可插拔本地 OCR（RapidOCR / Tesseract）
+  ocr.py            # 可插拔 OCR（RapidOCR / Tesseract / 阿里云 RecognizeAllText）
   clinical.py       # 临床评分计算器
   ontology.py       # 本地医学本体查询
   evidence.py       # GRADE 启发式证据评价
@@ -310,7 +313,7 @@ start.py            # 一键启动
 
 ## 已知限制
 
-- OCR 只有在安装 RapidOCR 或 Tesseract 后才生效；未安装时扫描页标记「需 OCR」。
+- 本地 OCR 只有在安装 RapidOCR 或 Tesseract 后才生效；阿里云 OCR 需要有效 AccessKey 和可访问的网络。两者都不可用时扫描页标记「需 OCR」。
 - 表格检测依赖 PDF 边框线，无边框表格可能无法转成 Markdown。
 - 问答模型与嵌入仍调用远端服务；本仓库没有内置本地 LLM 或本地嵌入模型。
 - 语义检索依赖远端 DashScope 嵌入服务；服务不可用时自动退化为关键词检索。

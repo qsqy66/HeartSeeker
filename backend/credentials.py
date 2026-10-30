@@ -7,7 +7,7 @@ from .providers import PROVIDERS
 
 # Non-chat services that still need their own credential slot.  Keeping them
 # out of PROVIDERS means they never appear in the chat-provider picker.
-EXTRA_KEY_SOURCES = {"qwen-rerank", "qwen-nli"}
+EXTRA_KEY_SOURCES = {"qwen-rerank", "qwen-nli", "aliyun-ocr"}
 
 
 class CredentialError(RuntimeError):

@@ -59,7 +59,19 @@
 
 - 页面没有文字层时，可调用本地 OCR：优先 RapidOCR（`rapidocr-onnxruntime`），其次 Tesseract（系统命令或 `TESSERACT_BIN`）。
 - 也可选择阿里云 OCR 统一识别（`RecognizeAllText`，SDK：`alibabacloud_ocr_api20210707`）。在设置页填写 AccessKey ID / Secret、Endpoint 和识别类型；Secret 只存入系统凭据库。
-- AccessKey 需为 RAM 用户，授予 `AliyunOCRFullAccess`（或最小权限 `ocr:RecognizeAllText`），建议只使用程序访问并定期轮换。也可用 `ALIBABA_CLOUD_ACCESS_KEY_ID` / `ALIBABA_CLOUD_ACCESS_KEY_SECRET` 环境变量。
+- AccessKey 需为 RAM 用户，授予 `AliyunOCRFullAccess`，或按最小权限只授予 `ocr:RecognizeAllText`：
+
+  ```json
+  {
+    "Version": "1",
+    "Statement": [
+      { "Effect": "Allow", "Action": "ocr:RecognizeAllText", "Resource": "*" }
+    ]
+  }
+  ```
+
+  建议只使用程序访问并定期轮换。也可用 `ALIBABA_CLOUD_ACCESS_KEY_ID` / `ALIBABA_CLOUD_ACCESS_KEY_SECRET` 环境变量。
+- Endpoint 填公网接入地址（如 `ocr-api.cn-hangzhou.aliyuncs.com`）或同地域 VPC 地址（`ocr-api-vpc.cn-hangzhou.aliyuncs.com`）。SDK 会自动完成 RPC HMAC-SHA1 签名，无需手工拼签名参数。
 - 阿里云 OCR 会将被识别页面的 PNG 上传到云端并按调用量计费。图像需小于 10MB、宽高 15–8192 像素、长宽比小于 50；超限页面会自动降低渲染 DPI，仍超限则该页记录 OCR 失败。
 - 引擎选择、语言（默认 `chi_sim+eng`）和渲染 DPI（默认 220）可在设置页调整，也可用 `PAPER_READER_OCR_ENGINE` / `PAPER_READER_OCR_LANG` / `PAPER_READER_OCR_DPI` 覆盖；阿里云 Endpoint/类型可用 `PAPER_READER_ALIYUN_OCR_ENDPOINT` / `PAPER_READER_ALIYUN_OCR_TYPE` 覆盖。
 - 未安装或未配置引擎时不会失败：页面保留 `needs_ocr` 标记，文字版 PDF、检索和问答不受影响。

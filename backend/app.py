@@ -1207,6 +1207,9 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
                 "context_token_budget"):
         if key in payload and str(payload[key]).strip() != "":
             values[key] = str(payload[key]).strip()
+    if values.get("ocr_endpoint"):
+        endpoint_value = values["ocr_endpoint"].split("://", 1)[-1]
+        values["ocr_endpoint"] = endpoint_value.rstrip("/")
     for key, value in values.items():
         if len(key) > 100 or len(value) > 10000:
             raise HTTPException(400, "设置键或值过长")

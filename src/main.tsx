@@ -1771,7 +1771,7 @@ function SettingsView({
                 placeholder="LTAI..."
               />
               <small className="field-help">
-                RAM 用户需授予 AliyunOCRFullAccess（或 ocr:RecognizeAllText），建议只使用程序访问。
+                RAM 用户需授予 AliyunOCRFullAccess，或最小权限 ocr:RecognizeAllText（Resource 为 *）；建议只使用程序访问并定期轮换。
               </small>
             </label>
             <label>
@@ -1795,7 +1795,9 @@ function SettingsView({
                 onChange={(event) => setSettings({ ...settings, ocr_endpoint: event.target.value })}
                 placeholder="ocr-api.cn-hangzhou.aliyuncs.com"
               />
-              <small className="field-help">按地域选择，例如 ocr-api.cn-shanghai.aliyuncs.com；不要带协议前缀。</small>
+              <small className="field-help">
+                公网用 ocr-api.cn-hangzhou.aliyuncs.com，同地域内网用 ocr-api-vpc.cn-hangzhou.aliyuncs.com；保存时会去掉协议前缀。
+              </small>
             </label>
             <label>
               阿里云 OCR 类型

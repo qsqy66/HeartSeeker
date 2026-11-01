@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import re
+import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
@@ -1238,6 +1240,67 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
                 (key, value, utc_now()),
             )
     return _settings_payload(values)
+
+
+class OcrTestPayload(BaseModel):
+    access_key_id: str = ""
+    access_key_secret: str = ""
+    endpoint: str = ""
+    ocr_type: str = ""
+
+
+@app.post("/api/ocr/test")
+def test_ocr_connection(payload: OcrTestPayload) -> dict[str, Any]:
+    """Render a small text image and verify the configured Aliyun OCR credentials."""
+    access_key_id = payload.access_key_id.strip() or _setting("ocr_access_key_id", "")
+    access_key_secret = (
+        payload.access_key_secret.strip()
+        or safe_key(ocr_module.ALIYUN_OCR_KEY)
+        or ""
+    )
+    endpoint = payload.endpoint.strip() or _setting(
+        "ocr_endpoint", ocr_module.DEFAULT_ALIYUN_ENDPOINT)
+    ocr_type = payload.ocr_type.strip() or _setting(
+        "ocr_type", ocr_module.DEFAULT_ALIYUN_OCR_TYPE)
+    if not access_key_id or not access_key_secret:
+        raise HTTPException(400, "请填写阿里云 AccessKey ID 和 AccessKey Secret")
+    engine = ocr_module.AliyunOcrEngine(
+        access_key_id=access_key_id,
+        access_key_secret=access_key_secret,
+        endpoint=endpoint,
+        ocr_type=ocr_type,
+        timeout=30.0,
+    )
+    if not engine.available():
+        raise HTTPException(400, "阿里云 OCR SDK 不可用，请先安装 alibabacloud_ocr_api20210707")
+
+    document = fitz.open()
+    try:
+        page = document.new_page(width=720, height=220)
+        page.insert_text((60, 110), "Paper Reader OCR test 12345", fontsize=28)
+        image = ocr_module.render_page_png(page, dpi=150)
+    finally:
+        document.close()
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
+        handle.write(image)
+        image_path = Path(handle.name)
+    started = time.monotonic()
+    try:
+        text = engine.ocr_image(image_path, "")
+    except ocr_module.OcrError as error:
+        raise HTTPException(400, str(error)) from error
+    finally:
+        image_path.unlink(missing_ok=True)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    preview = text.strip()[:200]
+    if not preview:
+        raise HTTPException(400, "连接成功，但测试图片未识别出文字")
+    return {
+        "ok": True,
+        "engine": "aliyun",
+        "text": preview,
+        "elapsed_ms": elapsed_ms,
+    }
 
 
 @app.get("/api/providers")

@@ -58,7 +58,8 @@
 ### 本地 OCR（扫描件）
 
 - 页面没有文字层时，可调用本地 OCR：优先 RapidOCR（`rapidocr-onnxruntime`），其次 Tesseract（系统命令或 `TESSERACT_BIN`）。
-- 也可选择阿里云 OCR 统一识别（`RecognizeAllText`，SDK：`alibabacloud_ocr_api20210707`）。在设置页填写 AccessKey ID / Secret、Endpoint 和识别类型；Secret 只存入系统凭据库。
+- 也可选择阿里云 OCR 统一识别（`RecognizeAllText`，SDK：`alibabacloud_ocr_api20210707`）。设置页集中提供 AccessKey ID / Secret、Endpoint、识别类型和连接测试；Secret 只存入系统凭据库，AccessKey ID 与 Endpoint 存在本地设置数据库。
+- 设置页的「测试阿里云 OCR 连接」会渲染一张测试图片并调用一次 `RecognizeAllText`，用于在导入论文前验证凭据、Endpoint 和权限，会消耗一次 OCR 调用。
 - AccessKey 需为 RAM 用户，授予 `AliyunOCRFullAccess`，或按最小权限只授予 `ocr:RecognizeAllText`：
 
   ```json
@@ -72,7 +73,7 @@
 
   建议只使用程序访问并定期轮换。
 
-- 推荐用环境变量保存 AccessKey，设置页的 AccessKey ID / Secret 留空即可：
+- 也可以改用环境变量保存 AccessKey（可选），此时设置页的 AccessKey ID / Secret 留空：
 
   ```bash
   # Linux / macOS（写入 shell 配置后重新打开终端）

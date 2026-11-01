@@ -12,7 +12,9 @@ sys.path.insert(0, str(ROOT))
 
 import fitz  # noqa: E402
 
-from backend import ingestion, ocr, storage  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+from backend import app as app_module, ingestion, ocr, storage  # noqa: E402
 
 
 class FakeOcrEngine:
@@ -128,6 +130,45 @@ class AliyunOcrEngineTestCase(unittest.TestCase):
         registry_engine = ocr.get_engine("aliyun")
         self.assertIsInstance(registry_engine, ocr.AliyunOcrEngine)
         self.assertEqual(registry_engine.name, "aliyun")
+
+
+class AliyunOcrApiTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = TestClient(app_module.app)
+        self.payload = {
+            "access_key_id": "LTAI-test",
+            "access_key_secret": "secret",
+            "endpoint": "ocr-api.cn-hangzhou.aliyuncs.com",
+            "ocr_type": "Advanced",
+        }
+
+    def test_connection_returns_recognised_text(self) -> None:
+        with unittest.mock.patch.object(ocr.AliyunOcrEngine, "available", return_value=True), \
+                unittest.mock.patch.object(ocr.AliyunOcrEngine, "ocr_image",
+                                          return_value="Paper Reader OCR test 12345"):
+            response = self.client.post("/api/ocr/test", json=self.payload)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["engine"], "aliyun")
+        self.assertIn("12345", body["text"])
+        self.assertGreaterEqual(body["elapsed_ms"], 0)
+
+    def test_connection_reports_engine_error(self) -> None:
+        with unittest.mock.patch.object(ocr.AliyunOcrEngine, "available", return_value=True), \
+                unittest.mock.patch.object(ocr.AliyunOcrEngine, "ocr_image",
+                                          side_effect=ocr.OcrError("AccessKey 无效")):
+            response = self.client.post("/api/ocr/test", json=self.payload)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("AccessKey", response.json()["detail"])
+
+    def test_connection_requires_credentials(self) -> None:
+        payload = {**self.payload, "access_key_id": "", "access_key_secret": ""}
+        with unittest.mock.patch.object(app_module, "safe_key", return_value=None), \
+                unittest.mock.patch.object(app_module, "_setting", return_value=""):
+            response = self.client.post("/api/ocr/test", json=payload)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("AccessKey", response.json()["detail"])
 
 
 class OcrTestCase(unittest.TestCase):

@@ -1589,9 +1589,39 @@ function SettingsView({
   availableModels: string[];
   loadModels: () => void;
 }) {
+  const [ocrTesting, setOcrTesting] = useState(false);
+  const [ocrTestResult, setOcrTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const protocolLabel = settings.protocols.find((item) => item.id === settings.protocol)?.label
     || settings.protocol
     || "未配置";
+
+  const testAliyunOcr = async () => {
+    setOcrTesting(true);
+    setOcrTestResult(null);
+    try {
+      const result = await readResponse<{ text: string; elapsed_ms: number }>(
+        await fetch(`${API}/ocr/test`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            access_key_id: settings.ocr_access_key_id,
+            access_key_secret: ocrAccessKeySecret,
+            endpoint: settings.ocr_endpoint,
+            ocr_type: settings.ocr_type,
+          }),
+        }),
+      );
+      setOcrTestResult({
+        ok: true,
+        message: `识别成功（${result.elapsed_ms} ms）：${result.text}`,
+      });
+    } catch (error) {
+      setOcrTestResult({ ok: false, message: `连接失败：${reasonOf(error)}` });
+    } finally {
+      setOcrTesting(false);
+    }
+  };
+
   return (
     <section className="settings">
       <span className="eyebrow">LOCAL CONFIGURATION</span>
@@ -1765,6 +1795,14 @@ function SettingsView({
         </label>
         {settings.ocr_engine === "aliyun" && (
           <>
+            <h3 className="settings-section">阿里云 OCR 配置</h3>
+            <div className="security-note">
+              <b>说明：</b>以下配置只保存在本机。AccessKey Secret 写入系统凭据库（keyring），
+              AccessKey ID、Endpoint 和识别类型写入本地设置数据库，均不会发送到除阿里云 OCR 之外的服务。
+              当前状态：{settings.ocr_access_key_id ? "AccessKey ID 已保存" : "AccessKey ID 未填写"}；
+              {settings.ocr_key_configured ? " Secret 已保存" : " Secret 未保存"}
+              {settings.ocr_env_configured ? "；检测到 AccessKey 环境变量（设置页留空时使用）" : ""}。
+            </div>
             <label>
               阿里云 AccessKey ID
               <input
@@ -1773,7 +1811,8 @@ function SettingsView({
                 placeholder="LTAI..."
               />
               <small className="field-help">
-                RAM 用户需授予 AliyunOCRFullAccess，或最小权限 ocr:RecognizeAllText（Resource 为 *）；建议只使用程序访问并定期轮换。
+                阿里云控制台 → 访问控制 RAM → 用户 → 创建 AccessKey。建议使用 RAM 子账号，仅授予
+                {" "}<code>ocr:RecognizeAllText</code>（Resource 为 <code>*</code>），不要使用主账号 AccessKey。
               </small>
             </label>
             <label>
@@ -1787,23 +1826,32 @@ function SettingsView({
                   : "仅保存在系统凭据库"}
               />
               <small className="field-help">
-                Secret 不写入数据库或日志；也可用 ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET 环境变量。
+                保存后只会显示“已配置”，不会回显；系统凭据库不可用时请改用环境变量
+                {" "}<code>ALIBABA_CLOUD_ACCESS_KEY_ID</code> / <code>ALIBABA_CLOUD_ACCESS_KEY_SECRET</code>。
               </small>
-              {settings.ocr_env_configured && (
-                <small className="field-help">
-                  已检测到环境变量 AccessKey；留空上方 AccessKey ID/Secret 时将使用环境变量。
-                </small>
-              )}
             </label>
             <label>
               阿里云 OCR Endpoint
               <input
+                list="aliyun-ocr-endpoints"
                 value={settings.ocr_endpoint || ""}
                 onChange={(event) => setSettings({ ...settings, ocr_endpoint: event.target.value })}
                 placeholder="ocr-api.cn-hangzhou.aliyuncs.com"
               />
+              <datalist id="aliyun-ocr-endpoints">
+                <option value="ocr-api.cn-hangzhou.aliyuncs.com" />
+                <option value="ocr-api-vpc.cn-hangzhou.aliyuncs.com" />
+                <option value="ocr-api.cn-shanghai.aliyuncs.com" />
+                <option value="ocr-api-vpc.cn-shanghai.aliyuncs.com" />
+                <option value="ocr-api.cn-beijing.aliyuncs.com" />
+                <option value="ocr-api-vpc.cn-beijing.aliyuncs.com" />
+                <option value="ocr-api.cn-shenzhen.aliyuncs.com" />
+                <option value="ocr-api-vpc.cn-shenzhen.aliyuncs.com" />
+              </datalist>
               <small className="field-help">
-                公网用 ocr-api.cn-hangzhou.aliyuncs.com，同地域内网用 ocr-api-vpc.cn-hangzhou.aliyuncs.com；保存时会去掉协议前缀。
+                公网：<code>ocr-api.&lt;地域&gt;.aliyuncs.com</code>；同地域 VPC：
+                {" "}<code>ocr-api-vpc.&lt;地域&gt;.aliyuncs.com</code>。保存时自动去掉
+                {" "}<code>https://</code> 前缀和末尾斜杠。
               </small>
             </label>
             <label>
@@ -1812,14 +1860,42 @@ function SettingsView({
                 value={settings.ocr_type || "Advanced"}
                 onChange={(event) => setSettings({ ...settings, ocr_type: event.target.value })}
               >
-                <option value="General">General（通用高精度）</option>
-                <option value="Advanced">Advanced（高级识别）</option>
-                <option value="MultiLang">MultiLang（多语言）</option>
+                <option value="General">General（通用高精度，适合普通文档）</option>
+                <option value="Advanced">Advanced（高级识别，默认，适合论文版面）</option>
+                <option value="MultiLang">MultiLang（多语言混合文档）</option>
               </select>
               <small className="field-help">
-                单张图像需小于 10MB、宽高 15–8192 像素且长宽比小于 50；超限页面会自动降低渲染 DPI。
+                识别类型决定阿里云使用的模型：普通论文建议 Advanced；中英混排或多语种文献可选 MultiLang。
               </small>
             </label>
+            <div className="security-note">
+              <b>图像限制：</b>支持 PDF、PNG、JPG/JPEG、BMP、GIF、TIFF、WebP；单张图像小于 10MB，
+              宽高在 15–8192 像素之间，长宽比小于 50，建议大于 500 像素。本应用按页渲染 PNG，
+              超过 10MB 时自动降低 DPI；仍超限则该页记录 OCR 失败。<br />
+              <b>计费与隐私：</b>扫描页图像会上传至阿里云 OCR 并按调用量计费；文字版 PDF 和本地
+              RapidOCR/Tesseract 方案不会产生该请求。
+            </div>
+            <div className="field-help">
+              <button
+                type="button"
+                className="primary"
+                onClick={() => void testAliyunOcr()}
+                disabled={ocrTesting}
+              >
+                {ocrTesting ? "正在测试…" : "测试阿里云 OCR 连接"}
+              </button>
+              <small
+                style={{
+                  display: "block",
+                  marginTop: 8,
+                  color: ocrTestResult ? (ocrTestResult.ok ? "#176b57" : "#a34040") : undefined,
+                }}
+              >
+                {ocrTestResult
+                  ? ocrTestResult.message
+                  : "使用当前填写的凭据和 Endpoint 识别一张测试图片；会消耗一次 OCR 调用。"}
+              </small>
+            </div>
           </>
         )}
         <label>

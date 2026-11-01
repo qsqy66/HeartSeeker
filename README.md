@@ -1,4 +1,4 @@
-# Paper Reader — 本地优先的医学论文 Agentic RAG
+# 觅心（HeartSeeker_Med）— 本地优先的医学论文 Agentic RAG
 
 面向医学生和临床研究者的论文精读助手。导入 PDF 后，在本机完成解析、混合检索与可核验问答；数据默认只存本机，只有主动使用模型功能时才向远端供应商发送必要的文本片段。
 
@@ -88,7 +88,7 @@
   若设置页也填写了凭据，则优先使用设置页的值（Secret 存在系统凭据库）；两者都未配置时阿里云 OCR 不可用。
 - Endpoint 填公网接入地址（如 `ocr-api.cn-hangzhou.aliyuncs.com`）或同地域 VPC 地址（`ocr-api-vpc.cn-hangzhou.aliyuncs.com`）。SDK 会自动完成 RPC HMAC-SHA1 签名，无需手工拼签名参数。
 - 阿里云 OCR 会将被识别页面的 PNG 上传到云端并按调用量计费。图像需小于 10MB、宽高 15–8192 像素、长宽比小于 50；超限页面会自动降低渲染 DPI，仍超限则该页记录 OCR 失败。
-- 引擎选择、语言（默认 `chi_sim+eng`）和渲染 DPI（默认 220）可在设置页调整，也可用 `PAPER_READER_OCR_ENGINE` / `PAPER_READER_OCR_LANG` / `PAPER_READER_OCR_DPI` 覆盖；阿里云 Endpoint/类型可用 `PAPER_READER_ALIYUN_OCR_ENDPOINT` / `PAPER_READER_ALIYUN_OCR_TYPE` 覆盖。
+- 引擎选择、语言（默认 `chi_sim+eng`）和渲染 DPI（默认 220）可在设置页调整，也可用 `HEARTSEEKER_MED_OCR_ENGINE` / `HEARTSEEKER_MED_OCR_LANG` / `HEARTSEEKER_MED_OCR_DPI` 覆盖；阿里云 Endpoint/类型可用 `HEARTSEEKER_MED_ALIYUN_OCR_ENDPOINT` / `HEARTSEEKER_MED_ALIYUN_OCR_TYPE` 覆盖。
 - 未安装或未配置引擎时不会失败：页面保留 `needs_ocr` 标记，文字版 PDF、检索和问答不受影响。
 - OCR 结果进入正常切片和索引流程，后续检索与引用校验与文字版 PDF 一致。
 
@@ -144,7 +144,7 @@ python3 start.py        # Windows: start.bat / python start.py
 
 首次运行会创建 `.venv`、安装后端依赖和前端依赖；之后复用。默认启动后端 `127.0.0.1:8765` 与前端 `127.0.0.1:5173` 并打开浏览器。`Ctrl+C` 一次停止两个服务。
 
-可选参数：`--no-browser`；环境变量 `PAPER_READER_PORT` / `PAPER_READER_FRONTEND_PORT` 可覆盖端口。
+可选参数：`--no-browser`；环境变量 `HEARTSEEKER_MED_PORT` / `HEARTSEEKER_MED_FRONTEND_PORT` 可覆盖端口。
 
 ### 手动启动
 
@@ -167,10 +167,10 @@ npm run dev
 ## 使用流程
 
 1. **配置模型**：设置与隐私 → 选择供应商（或「自定义」并选择协议、填写 Base URL）→ 填 API Key → 读取模型或手动填写模型 ID → 保存。语义检索另需配置 DashScope 嵌入 Key。同一页面可配置本地处理管线：OCR 引擎/语言/DPI、重排引擎与模型、NLI 模型、上下文 token 预算。
-2. **导入论文**：论文库 → 导入带文本层的 PDF（≤50MB、≤300 页）。上传后立即返回，首页卡片显示解析/向量化进度；完成后自动打开工作台。
-3. **全库检索**：首页「全库检索」输入问题或术语，结果带论文标题、页码和混合检索来源，点击直接跳转并高亮。
+2. **导入论文**：论文库 → 导入带文本层的 PDF（≤50MB、≤300 页）。上传后立即返回，论文库卡片显示解析/向量化进度；完成后自动打开工作台。
+3. **全库检索**：论文库 · 全库检索输入问题或术语，结果带论文标题、页码和混合检索来源，点击直接跳转并高亮。
 4. **论文内问答**：工作台 → 论文内问答。展开「执行轨迹」可查看检索/翻页/计算等步骤和引用核验状态。
-5. **通用对话**：首页 AI 学习助手。有论文时可切换「论文库检索」或「通用医学知识」。
+5. **通用对话**：主对话 · 通用医学；可新建多个会话，各自保留独立记忆。有论文时可切换「论文库检索」或「通用医学知识」。
 6. **结构化精读**：查看带原文证据的字段；「刷新精读」会调用当前问答模型重新提取。
 
 ### Qwen 远程重排配置
@@ -179,13 +179,13 @@ npm run dev
 
 - **重排模型**：默认 `qwen3.7-text-rerank`，留空也会使用该默认值。
 - **重排 Base URL**：默认 `https://cn-beijing.maas.qianwenaiapi.com/api/v1/services/rerank/text-rerank/text-rerank`，可替换为其他兼容地址。
-- **重排 API Key**：单独保存在系统凭据库；留空时依次尝试千问嵌入 Key 和 `DASHSCOPE_API_KEY`。也可用环境变量 `PAPER_READER_RERANK_URL` 覆盖默认地址。
+- **重排 API Key**：单独保存在系统凭据库；留空时依次尝试千问嵌入 Key 和 `DASHSCOPE_API_KEY`。也可用环境变量 `HEARTSEEKER_MED_RERANK_URL` 覆盖默认地址。
 
 请求按 DashScope 文本重排格式发送 `model / input.query / input.documents / parameters`。未配置 Key、网络不可用或服务报错时，检索自动退回本地词法重排，回答仍会正常生成。
 
 ## 数据与隐私
 
-- 默认数据目录：用户目录下的 `PaperReader`（Windows 为 `%USERPROFILE%\PaperReader`），可用 `PAPER_READER_HOME` 覆盖。
+- 默认数据目录：用户目录下的 `HeartSeeker_Med`（Windows 为 `%USERPROFILE%\HeartSeeker_Med`），可用 `HEARTSEEKER_MED_HOME` 覆盖。已有安装若存在旧目录 `PaperReader`，会自动继续使用旧目录，数据无需手动迁移；旧版 `PAPER_READER_*` 环境变量与旧凭据库命名空间仍兼容。
 - 目录内容：`papers/`（原始 PDF）、`database/`（SQLite）、`vectors/`（LanceDB）、`cache/`、`logs/`、`exports/`。
 - 远端调用边界：读取模型列表、结构化精读、Agent 问答会访问所选问答供应商；嵌入计算访问 DashScope；启用 Qwen 远程重排时会向配置的重排地址发送查询和候选片段。只发送问题、必要原文片段、嵌入文本和重排候选。问答、嵌入、重排 Key 分别保存在系统凭据库。
 - Agent 运行轨迹、引用、反馈和用户笔记保存在本地 SQLite（`agent_runs`、`agent_steps`、`feedback`、`agent_memories`）。
@@ -271,8 +271,8 @@ python scripts/evaluate.py --json
 
 ```bash
 python scripts/evaluate.py \
-  --db ~/PaperReader/database/paper_reader.sqlite3 \
-  --vectors ~/PaperReader/vectors \
+  --db ~/HeartSeeker_Med/database/heartseeker_med.sqlite3 \
+  --vectors ~/HeartSeeker_Med/vectors \
   --dataset eval/live_cases.json --no-vectors
 ```
 

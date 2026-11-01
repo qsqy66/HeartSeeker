@@ -5,8 +5,11 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .paper-reader-*/
+.heartseeker-med-*/
 PaperReader/
+HeartSeeker_Med/
 .env
 .env.*
 *.sqlite3
 *.db
+pdf/

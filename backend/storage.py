@@ -9,9 +9,26 @@ from typing import Optional
 
 from . import tokenization
 
-APP_HOME = Path(os.environ.get("PAPER_READER_HOME", Path.home() / "PaperReader"))
+LEGACY_APP_HOME = Path.home() / "PaperReader"
+NEW_APP_HOME = Path.home() / "HeartSeeker_Med"
+
+
+def _default_app_home() -> Path:
+    """Prefer the new data directory, but keep existing installations intact."""
+    for variable in ("HEARTSEEKER_MED_HOME", "PAPER_READER_HOME"):
+        override = os.environ.get(variable)
+        if override:
+            return Path(override)
+    if LEGACY_APP_HOME.is_dir() and not NEW_APP_HOME.is_dir():
+        return LEGACY_APP_HOME
+    return NEW_APP_HOME
+
+
+APP_HOME = _default_app_home()
 PAPERS_DIR = APP_HOME / "papers"
-DB_PATH = APP_HOME / "database" / "paper_reader.sqlite3"
+_LEGACY_DB_PATH = APP_HOME / "database" / "paper_reader.sqlite3"
+DB_PATH = (_LEGACY_DB_PATH if _LEGACY_DB_PATH.exists()
+           else APP_HOME / "database" / "heartseeker_med.sqlite3")
 VECTORS_DIR = APP_HOME / "vectors"
 
 SCHEMA = """
@@ -95,15 +112,22 @@ CREATE TABLE IF NOT EXISTS chat_summaries (
     summarized_upto INTEGER NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS general_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS general_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER,
     role TEXT NOT NULL,
     content TEXT NOT NULL,
     provider TEXT,
     created_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS general_summary (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
+CREATE TABLE IF NOT EXISTS general_session_summaries (
+    session_id INTEGER PRIMARY KEY,
     summary TEXT NOT NULL,
     summarized_upto INTEGER NOT NULL,
     updated_at TEXT NOT NULL
@@ -218,6 +242,30 @@ def _ensure_search_index(connection: sqlite3.Connection) -> None:
         connection.execute("INSERT INTO chunks_fts_seg(chunks_fts_seg) VALUES('rebuild')")
 
 
+def _assign_legacy_general_messages(connection: sqlite3.Connection) -> None:
+    """Move pre-session general chat rows into a session of their own.
+
+    Older databases stored one endless general conversation.  Giving those
+    rows a session keeps the existing history visible after the UI starts
+    listing separate conversations.
+    """
+    pending = connection.execute(
+        "SELECT COUNT(*) AS n, MIN(created_at) AS first, MAX(created_at) AS last "
+        "FROM general_messages WHERE session_id IS NULL"
+    ).fetchone()
+    if not pending or not pending["n"]:
+        return
+    now = pending["last"] or utc_now()
+    cursor = connection.execute(
+        "INSERT INTO general_sessions(title,created_at,updated_at) VALUES(?,?,?)",
+        ("历史对话", pending["first"] or now, now),
+    )
+    connection.execute(
+        "UPDATE general_messages SET session_id=? WHERE session_id IS NULL",
+        (cursor.lastrowid,),
+    )
+
+
 def initialize_storage(app_home: Optional[Path | str] = None,
                        db_path: Optional[Path | str] = None,
                        papers_dir: Optional[Path | str] = None,
@@ -248,5 +296,7 @@ def initialize_storage(app_home: Optional[Path | str] = None,
         ensure_column(connection, "chunks", "section", "section TEXT NOT NULL DEFAULT ''")
         ensure_column(connection, "chunks", "heading", "heading TEXT NOT NULL DEFAULT ''")
         ensure_column(connection, "chunks", "search_text", "search_text TEXT NOT NULL DEFAULT ''")
+        ensure_column(connection, "general_messages", "session_id", "session_id INTEGER")
+        _assign_legacy_general_messages(connection)
         _ensure_search_index(connection)
         connection.commit()

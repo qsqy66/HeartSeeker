@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Paper Reader 环境安装脚本（Linux）
+# 觅心（HeartSeeker_Med）环境安装脚本（Linux）
 # 自动检测并安装 Python 3.10+ 与 Node.js 18+，随后调用 start.py 一键部署（自动打开浏览器）。
 # 安装系统包需要 sudo 权限；只装缺失/过旧的部分，不会动已满足要求的环境。
 #

@@ -8,8 +8,8 @@ library and can opt into vector search with --vectors.
 Examples:
     python scripts/evaluate.py
     python scripts/evaluate.py --json
-    python scripts/evaluate.py --db ~/PaperReader/database/paper_reader.sqlite3 \
-        --vectors ~/PaperReader/vectors --dataset eval/live_cases.json
+    python scripts/evaluate.py --db ~/HeartSeeker_Med/database/heartseeker_med.sqlite3 \
+        --vectors ~/HeartSeeker_Med/vectors --dataset eval/live_cases.json
 """
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def _print_report(report: dict, threshold_recall: float, threshold_citation: flo
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Paper Reader retrieval/citation evaluation")
+    parser = argparse.ArgumentParser(description="觅心（HeartSeeker_Med） retrieval/citation evaluation")
     parser.add_argument("--offline", action="store_true",
                         help="force the bundled fixture (default when --db is absent)")
     parser.add_argument("--dataset", type=Path,

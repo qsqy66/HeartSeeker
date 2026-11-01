@@ -37,7 +37,7 @@ class RetrievalQualityTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
-        self.db = self.home / "database" / "paper_reader.sqlite3"
+        self.db = self.home / "database" / "heartseeker_med.sqlite3"
         self.vectors = self.home / "vectors"
         storage.initialize_storage(app_home=self.home, db_path=self.db, vectors_dir=self.vectors)
         with storage.get_connection(self.db) as connection:

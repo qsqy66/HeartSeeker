@@ -10,7 +10,7 @@ Examples:
     python scripts/benchmark_models.py --offline \\
         --models qwen2.5:7b,llama3.1:8b
 
-    python scripts/benchmark_models.py --db ~/PaperReader/database/paper_reader.sqlite3 \\
+    python scripts/benchmark_models.py --db ~/HeartSeeker_Med/database/heartseeker_med.sqlite3 \\
         --provider ollama --base-url http://127.0.0.1:11434/v1 \\
         --models qwen2.5:14b --output benchmarks/qwen.json
 """
@@ -103,7 +103,7 @@ def main() -> int:
 
     temp = None
     if args.db is None or args.offline:
-        temp = tempfile.TemporaryDirectory(prefix="paper-reader-benchmark-")
+        temp = tempfile.TemporaryDirectory(prefix="heartseeker-med-benchmark-")
         db_path, vectors_dir = evaluation.build_fixture(args.corpus, temp.name)
     else:
         db_path = args.db

@@ -146,6 +146,7 @@ class QwenReranker:
         self.model_name = (model or "").strip() or DEFAULT_QWEN_RERANK_MODEL
         self.base_url = (
             (base_url or "").strip()
+            or os.environ.get("HEARTSEEKER_MED_RERANK_URL", "").strip()
             or os.environ.get("PAPER_READER_RERANK_URL", "").strip()
             or DEFAULT_QWEN_RERANK_URL
         )

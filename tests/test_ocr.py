@@ -145,7 +145,7 @@ class AliyunOcrApiTestCase(unittest.TestCase):
     def test_connection_returns_recognised_text(self) -> None:
         with unittest.mock.patch.object(ocr.AliyunOcrEngine, "available", return_value=True), \
                 unittest.mock.patch.object(ocr.AliyunOcrEngine, "ocr_image",
-                                          return_value="Paper Reader OCR test 12345"):
+                                          return_value="HeartSeeker_Med OCR test 12345"):
             response = self.client.post("/api/ocr/test", json=self.payload)
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -171,11 +171,25 @@ class AliyunOcrApiTestCase(unittest.TestCase):
         self.assertIn("AccessKey", response.json()["detail"])
 
 
+class SettingsCredentialTestCase(unittest.TestCase):
+    def test_non_chat_credential_slots_are_accepted(self) -> None:
+        with unittest.mock.patch.object(
+                app_module, "_credential_key_store", return_value="saved") as store:
+            self.assertEqual(app_module._key_store(ocr.ALIYUN_OCR_KEY, "secret"), "saved")
+            app_module._key_store("qwen-rerank", "secret")
+        self.assertEqual(store.call_count, 2)
+
+    def test_unknown_provider_is_still_rejected(self) -> None:
+        with self.assertRaises(app_module.HTTPException) as caught:
+            app_module._key_store("not-a-provider", "secret")
+        self.assertEqual(caught.exception.status_code, 400)
+
+
 class OcrTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
-        self.db = self.home / "database" / "paper_reader.sqlite3"
+        self.db = self.home / "database" / "heartseeker_med.sqlite3"
         self.vectors = self.home / "vectors"
         storage.initialize_storage(app_home=self.home, db_path=self.db, vectors_dir=self.vectors)
         with storage.get_connection(self.db) as connection:

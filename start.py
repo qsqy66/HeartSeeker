@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""一键启动 Paper Reader：后端 FastAPI + 前端 Vite。
+"""一键启动觅心（HeartSeeker_Med）：后端 FastAPI + 前端 Vite。
 
 用法：
     python start.py                # 启动后端+前端，并自动打开浏览器
@@ -24,8 +24,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
-BACKEND_PORT = int(os.environ.get("PAPER_READER_PORT", "8765"))
-FRONTEND_PORT = int(os.environ.get("PAPER_READER_FRONTEND_PORT", "5173"))
+BACKEND_PORT = int(os.environ.get("HEARTSEEKER_MED_PORT")
+                   or os.environ.get("PAPER_READER_PORT", "8765"))
+FRONTEND_PORT = int(os.environ.get("HEARTSEEKER_MED_FRONTEND_PORT")
+                    or os.environ.get("PAPER_READER_FRONTEND_PORT", "5173"))
 BACKEND_URL = f"http://127.0.0.1:{BACKEND_PORT}"
 FRONTEND_URL = f"http://127.0.0.1:{FRONTEND_PORT}"
 
@@ -192,7 +194,7 @@ def start_frontend() -> subprocess.Popen:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="一键启动 Paper Reader")
+    parser = argparse.ArgumentParser(description="一键启动觅心（HeartSeeker_Med）")
     parser.add_argument("--no-browser", action="store_true", help="启动后不自动打开浏览器")
     parser.add_argument("--dev", action="store_true", help="强制启动 Vite 开发前端（需要 Node.js）")
     parser.add_argument("--prod", action="store_true", help="只启动后端并托管已构建的 dist/")
@@ -220,7 +222,7 @@ def main() -> int:
     backend_up = wait_http(f"{BACKEND_URL}/api/health", timeout=1.0)
     frontend_up = backend_up if mode == "built" else wait_http(FRONTEND_URL, timeout=1.0)
     if backend_up and frontend_up:
-        log("ok", "Paper Reader 已在运行，直接打开浏览器。")
+        log("ok", "觅心 已在运行，直接打开浏览器。")
         if not args.no_browser:
             webbrowser.open(app_url)
         return 0
@@ -265,9 +267,9 @@ def main() -> int:
             pass
 
     if mode == "built":
-        print(f"\n✅ Paper Reader 已启动（单进程模式）：{app_url}\n   按 Ctrl+C 停止服务。\n", flush=True)
+        print(f"\n✅ 觅心（HeartSeeker_Med）已启动（单进程模式）：{app_url}\n   按 Ctrl+C 停止服务。\n", flush=True)
     else:
-        print(f"\n✅ Paper Reader 已启动：{app_url}\n   按 Ctrl+C 停止两个服务。\n", flush=True)
+        print(f"\n✅ 觅心（HeartSeeker_Med）已启动：{app_url}\n   按 Ctrl+C 停止两个服务。\n", flush=True)
     try:
         while True:
             for name, proc in _procs:

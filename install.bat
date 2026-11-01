@@ -1,6 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
-rem Paper Reader 环境安装脚本（Windows）
+rem 觅心（HeartSeeker_Med）环境安装脚本（Windows）
 rem 自动检测并安装 Python 3.12 与 Node.js LTS（通过 winget），随后调用 start.py 部署并自动打开浏览器。
 rem 只装缺失的部分；winget 需要 Windows 10 1809+ / Windows 11。
 cd /d "%~dp0"

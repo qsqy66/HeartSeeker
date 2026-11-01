@@ -22,7 +22,9 @@ from fastapi.responses import StreamingResponse
 
 from . import clinical, evidence, memory, ocr as ocr_module, ontology
 from .agent import AgentConfig, AgentError, AgentRunner
-from .credentials import CredentialError, key_store as _credential_key_store, safe_key
+from .credentials import (
+    EXTRA_KEY_SOURCES, CredentialError, key_store as _credential_key_store, safe_key,
+)
 from .embedding import DEFAULT_EMBED_MODEL, delete_paper_vectors
 from .ingestion import (
     is_heading as _is_heading,
@@ -38,7 +40,7 @@ from .structured import extract_fields
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_PAGES = 300
 RECENT_TURNS = 10  # 最近 10 轮对话原文保留，更早的历史压缩为摘要
-LOGGER = logging.getLogger("paper_reader.ingestion")
+LOGGER = logging.getLogger("heartseeker_med.ingestion")
 
 # One worker keeps CPU/embedding-heavy imports serialized while the API stays
 # responsive; imports are durable in SQLite, so a crash is recoverable via retry.
@@ -210,6 +212,7 @@ class ChatPayload(BaseModel):
     provider: Optional[str] = None
     stream: bool = False
     retry: bool = False
+    session_id: Optional[int] = None
 
 
 class AgentChatPayload(BaseModel):
@@ -220,6 +223,7 @@ class AgentChatPayload(BaseModel):
     provider: Optional[str] = None
     stream: bool = True
     retry: bool = False
+    session_id: Optional[int] = None
 
 
 class ModelsPayload(BaseModel):
@@ -250,7 +254,9 @@ def _key_store(provider: str, value: Optional[str] = None) -> Optional[str]:
     """Store API keys in the operating system credential manager."""
     try:
         provider = provider.lower().strip()
-        if provider not in providers.PROVIDERS:
+        # OCR and rerank use dedicated credential slots rather than chat
+        # providers, so they must be accepted here too.
+        if provider not in providers.PROVIDERS and provider not in EXTRA_KEY_SOURCES:
             raise HTTPException(400, "未知的模型供应商")
         return _credential_key_store(provider, value)
     except CredentialError as error:
@@ -387,12 +393,64 @@ def _paper_conversation_state(paper_id: int, provider: str, key: str, model: str
     return summary, recent
 
 
-def _general_conversation_state(provider: str, key: str, model: str) -> tuple[str, list[dict[str, Any]]]:
+def _resolve_chat_session(session_id: Optional[int] = None,
+                          create: bool = False) -> Optional[int]:
+    """Resolve a general-chat session, falling back to the most recent one.
+
+    ``create`` lets first-time or legacy clients start a session implicitly.
+    An explicit id that does not exist is a client error, not a new session.
+    """
+    with get_connection() as connection:
+        if session_id is not None:
+            row = connection.execute(
+                "SELECT id FROM general_sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            if row is None:
+                raise HTTPException(404, "会话不存在")
+            return int(row["id"])
+        row = connection.execute(
+            "SELECT id FROM general_sessions ORDER BY updated_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+        if not create:
+            return None
+        now = utc_now()
+        cursor = connection.execute(
+            "INSERT INTO general_sessions(title,created_at,updated_at) VALUES('',?,?)",
+            (now, now),
+        )
+        return int(cursor.lastrowid)
+
+
+def _session_title(message: str) -> str:
+    line = next((item.strip() for item in message.splitlines() if item.strip()), "")
+    return line[:40]
+
+
+def _touch_chat_session(connection, session_id: int, title: str = "") -> None:
+    if title:
+        connection.execute(
+            "UPDATE general_sessions SET title=CASE WHEN title='' THEN ? ELSE title END,"
+            " updated_at=? WHERE id=?",
+            (title, utc_now(), session_id),
+        )
+    else:
+        connection.execute(
+            "UPDATE general_sessions SET updated_at=? WHERE id=?", (utc_now(), session_id))
+
+
+def _general_conversation_state(provider: str, key: str, model: str,
+                                session_id: int) -> tuple[str, list[dict[str, Any]]]:
     with get_connection() as connection:
         messages = [dict(row) for row in connection.execute(
-            "SELECT id, role, content FROM general_messages ORDER BY id"
+            "SELECT id, role, content FROM general_messages WHERE session_id=? ORDER BY id",
+            (session_id,),
         ).fetchall()]
-        row = connection.execute("SELECT summary, summarized_upto FROM general_summary WHERE id=1").fetchone()
+        row = connection.execute(
+            "SELECT summary, summarized_upto FROM general_session_summaries WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
     older, recent = _split_history(messages)
     if not older:
         return "", recent
@@ -405,9 +463,10 @@ def _general_conversation_state(provider: str, key: str, model: str) -> tuple[st
     summary = _summarize_history(provider, key, model, summary, uncovered)
     with get_connection() as connection:
         connection.execute(
-            "INSERT INTO general_summary(id, summary, summarized_upto, updated_at) VALUES(1,?,?,?) "
-            "ON CONFLICT(id) DO UPDATE SET summary=excluded.summary, summarized_upto=excluded.summarized_upto, updated_at=excluded.updated_at",
-            (summary, last_older_id, utc_now()),
+            "INSERT INTO general_session_summaries(session_id, summary, summarized_upto, updated_at) "
+            "VALUES(?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET summary=excluded.summary, "
+            "summarized_upto=excluded.summarized_upto, updated_at=excluded.updated_at",
+            (session_id, summary, last_older_id, utc_now()),
         )
     return summary, recent
 
@@ -463,7 +522,8 @@ def _paper_chat_stream(paper_id: int, provider: str, key: str, model: str, promp
                      ensure_ascii=False) + "\n"
 
 
-def _general_chat_stream(provider: str, key: str, model: str, prompt: str, question: str = ""):
+def _general_chat_stream(provider: str, key: str, model: str, prompt: str,
+                         question: str = "", session_id: Optional[int] = None):
     parts: list[str] = []
     try:
         for delta in _stream_provider_chat(provider, key, prompt, model):
@@ -478,12 +538,16 @@ def _general_chat_stream(provider: str, key: str, model: str, prompt: str, quest
         return
     answer, _ = apply_safety(answer, question)
     with get_connection() as connection:
-        cursor = connection.execute("INSERT INTO general_messages(role,content,provider,created_at) VALUES(?,?,?,?)",
-                                     ("assistant", answer, provider, utc_now()))
+        cursor = connection.execute(
+            "INSERT INTO general_messages(session_id,role,content,provider,created_at) "
+            "VALUES(?,?,?,?,?)",
+            (session_id, "assistant", answer, provider, utc_now()))
+        if session_id is not None:
+            _touch_chat_session(connection, session_id)
     yield json.dumps({"done": True, "id": cursor.lastrowid, "content": answer}, ensure_ascii=False) + "\n"
 
 
-app = FastAPI(title="Paper Reader Local API", version="0.2.0")
+app = FastAPI(title="觅心 HeartSeeker_Med Local API", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -593,7 +657,8 @@ def appraise_evidence(payload: EvidenceAppraisePayload) -> dict[str, Any]:
 
 
 def _store_agent_message(mode: str, paper_id: Optional[int], role: str,
-                         content: str, provider: str) -> None:
+                         content: str, provider: str,
+                         session_id: Optional[int] = None) -> None:
     if not content.strip():
         return
     with get_connection() as connection:
@@ -606,13 +671,19 @@ def _store_agent_message(mode: str, paper_id: Optional[int], role: str,
             )
         else:
             connection.execute(
-                "INSERT INTO general_messages(role,content,provider,created_at) VALUES(?,?,?,?,?)",
-                (role, content, provider, utc_now()),
+                "INSERT INTO general_messages(session_id,role,content,provider,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (session_id, role, content, provider, utc_now()),
             )
+            if session_id is not None:
+                _touch_chat_session(
+                    connection, session_id,
+                    _session_title(content) if role == "user" else "",
+                )
 
 
 def _agent_history(mode: str, paper_id: Optional[int], retry: bool,
-                   message: str) -> list[dict[str, Any]]:
+                   message: str, session_id: Optional[int] = None) -> list[dict[str, Any]]:
     with get_connection() as connection:
         if mode == "paper" and paper_id is not None:
             rows = connection.execute(
@@ -621,7 +692,9 @@ def _agent_history(mode: str, paper_id: Optional[int], retry: bool,
             ).fetchall()
         else:
             rows = connection.execute(
-                "SELECT role,content FROM general_messages ORDER BY id DESC LIMIT 20"
+                "SELECT role,content FROM general_messages WHERE session_id=? "
+                "ORDER BY id DESC LIMIT 20",
+                (session_id,),
             ).fetchall()
     history = [dict(row) for row in reversed(rows)]
     if retry and history and history[-1]["role"] == "user" \
@@ -658,7 +731,12 @@ def agent_chat(payload: AgentChatPayload):
     elif paper_id is not None:
         mode = "paper"
 
-    history = _agent_history(mode, paper_id, payload.retry, message)
+    # General/library conversations are grouped into sessions so a new chat
+    # starts with fresh recent-turn memory instead of inheriting an old one.
+    session_id = None
+    if mode != "paper":
+        session_id = _resolve_chat_session(payload.session_id, create=True)
+    history = _agent_history(mode, paper_id, payload.retry, message, session_id)
     try:
         token_budget_value = int(_setting("context_token_budget", "24000"))
     except ValueError:
@@ -693,17 +771,19 @@ def agent_chat(payload: AgentChatPayload):
         except AgentError as error:
             raise HTTPException(502, str(error)) from error
         if not payload.retry:
-            _store_agent_message(mode, paper_id, "user", message, provider)
-        _store_agent_message(mode, paper_id, "assistant", done.get("content", ""), provider)
+            _store_agent_message(mode, paper_id, "user", message, provider, session_id)
+        _store_agent_message(mode, paper_id, "assistant", done.get("content", ""),
+                             provider, session_id)
         return done
 
     if not payload.retry:
-        _store_agent_message(mode, paper_id, "user", message, provider)
+        _store_agent_message(mode, paper_id, "user", message, provider, session_id)
 
     def generate():
         for event in runner.run_iter(message):
             if event.get("type") == "done":
-                _store_agent_message(mode, paper_id, "assistant", event.get("content", ""), provider)
+                _store_agent_message(mode, paper_id, "assistant", event.get("content", ""),
+                                     provider, session_id)
             yield json.dumps(event, ensure_ascii=False) + "\n"
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
@@ -762,12 +842,12 @@ def export_agent_run(run_id: int, format: str = "md") -> Response:
     fmt = (format or "md").strip().lower()
     if fmt not in {"md", "markdown", "json", "csv"}:
         raise HTTPException(400, "format 必须是 md、json 或 csv")
-    filename = f"paper-reader-run-{run_id}"
+    filename = f"heartseeker-med-run-{run_id}"
 
     if fmt in {"md", "markdown"}:
         citations = data["citations_json"]
         lines = [
-            "# Paper Reader 回答", "",
+            "# 觅心 回答", "",
             f"- 问题：{data['question']}",
             f"- 模式：{data['mode']}",
             f"- 模型：{data.get('provider') or '—'} / {data.get('model') or '—'}",
@@ -1277,7 +1357,7 @@ def test_ocr_connection(payload: OcrTestPayload) -> dict[str, Any]:
     document = fitz.open()
     try:
         page = document.new_page(width=720, height=220)
-        page.insert_text((60, 110), "Paper Reader OCR test 12345", fontsize=28)
+        page.insert_text((60, 110), "HeartSeeker_Med OCR test 12345", fontsize=28)
         image = ocr_module.render_page_png(page, dpi=150)
     finally:
         document.close()
@@ -1445,19 +1525,23 @@ def general_chat(payload: ChatPayload) -> dict[str, Any]:
         raise HTTPException(400, "问题不能为空")
     endpoint, key, model = _chat_target(payload.provider)
     provider = endpoint.id
-    summary, recent = _general_conversation_state(provider, key, model)
+    session_id = _resolve_chat_session(payload.session_id, create=True)
+    summary, recent = _general_conversation_state(provider, key, model, session_id)
     if payload.retry:
         # 重试：当前问题已在上次落库，避免在 prompt 里重复出现
         if recent and recent[-1]["role"] == "user":
             recent = recent[:-1]
     else:
         with get_connection() as connection:
-            connection.execute("INSERT INTO general_messages(role,content,provider,created_at) VALUES(?,?,?,?)",
-                               ("user", message, provider, utc_now()))
+            connection.execute(
+                "INSERT INTO general_messages(session_id,role,content,provider,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (session_id, "user", message, provider, utc_now()))
+            _touch_chat_session(connection, session_id, _session_title(message))
     prompt = _build_general_prompt(summary, recent, message)
     if payload.stream:
         return StreamingResponse(
-            _general_chat_stream(provider, key, model, prompt, message),
+            _general_chat_stream(provider, key, model, prompt, message, session_id),
             media_type="application/x-ndjson",
         )
     answer = _provider_chat(provider, key, prompt, model).strip()
@@ -1465,16 +1549,49 @@ def general_chat(payload: ChatPayload) -> dict[str, Any]:
         raise HTTPException(502, "模型返回了空响应")
     answer, _ = apply_safety(answer, message)
     with get_connection() as connection:
-        cursor = connection.execute("INSERT INTO general_messages(role,content,provider,created_at) VALUES(?,?,?,?)",
-                                     ("assistant", answer, provider, utc_now()))
-    return {"id": cursor.lastrowid, "content": answer, "answer": answer, "provider": provider}
+        cursor = connection.execute(
+            "INSERT INTO general_messages(session_id,role,content,provider,created_at) "
+            "VALUES(?,?,?,?,?)",
+            (session_id, "assistant", answer, provider, utc_now()))
+        _touch_chat_session(connection, session_id)
+    return {"id": cursor.lastrowid, "content": answer, "answer": answer, "provider": provider,
+            "session_id": session_id}
+
+
+@app.get("/api/chat/sessions")
+def general_chat_sessions() -> list[dict[str, Any]]:
+    with get_connection() as connection:
+        rows = connection.execute(
+            "SELECT s.id, s.title, s.created_at, s.updated_at, COUNT(m.id) AS message_count "
+            "FROM general_sessions s "
+            "LEFT JOIN general_messages m ON m.session_id = s.id "
+            "GROUP BY s.id ORDER BY s.updated_at DESC, s.id DESC"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.post("/api/chat/sessions")
+def create_general_chat_session() -> dict[str, Any]:
+    now = utc_now()
+    with get_connection() as connection:
+        cursor = connection.execute(
+            "INSERT INTO general_sessions(title,created_at,updated_at) VALUES('',?,?)",
+            (now, now),
+        )
+    return {"id": cursor.lastrowid, "title": "", "created_at": now,
+            "updated_at": now, "message_count": 0}
 
 
 @app.get("/api/chat")
-def general_chat_history() -> list[dict[str, Any]]:
+def general_chat_history(session_id: Optional[int] = None) -> list[dict[str, Any]]:
+    resolved = _resolve_chat_session(session_id)
+    if resolved is None:
+        return []
     with get_connection() as connection:
         rows = connection.execute(
-            "SELECT id,role,content,provider,created_at FROM general_messages ORDER BY id"
+            "SELECT id,role,content,provider,created_at FROM general_messages "
+            "WHERE session_id=? ORDER BY id",
+            (resolved,),
         ).fetchall()
     return [dict(row) for row in rows]
 

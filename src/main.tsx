@@ -4,6 +4,7 @@ import {
   FormEvent,
   SetStateAction,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -92,6 +93,13 @@ type ChatMessage = {
   error?: string;
   pending?: boolean;
   created_at?: string;
+};
+type ChatSession = {
+  id: number;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
 };
 type AgentDone = {
   id?: number;
@@ -387,7 +395,7 @@ function MessageView({
 }) {
   return (
     <div className={`message ${message.role}`}>
-      <span>{message.role === "user" ? "你" : "Paper Reader"}</span>
+      <span>{message.role === "user" ? "你" : "觅心"}</span>
       {message.role === "assistant" && message.pending && !message.content ? (
         <p className="typing">正在检索证据并核验引用…</p>
       ) : (
@@ -426,7 +434,7 @@ function MessageView({
 function App() {
   const [papers, setPapers] = useState<Paper[]>([]);
   const [selected, setSelected] = useState<PaperDetails | null>(null);
-  const [tab, setTab] = useState<"library" | "reader" | "settings">("library");
+  const [tab, setTab] = useState<"chat" | "library" | "reader" | "settings">("chat");
   const [readerTab, setReaderTab] = useState<"read" | "insights" | "chat">("read");
   const [query, setQuery] = useState("");
   const [searchMode, setSearchMode] = useState<"hybrid" | "keyword">("hybrid");
@@ -484,6 +492,8 @@ function App() {
   const [generalChat, setGeneralChat] = useState<ChatMessage[]>([]);
   const [generalQuestion, setGeneralQuestion] = useState("");
   const [generalMode, setGeneralMode] = useState<GeneralMode>("library");
+  const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
   const [libraryQuery, setLibraryQuery] = useState("");
   const [libraryResults, setLibraryResults] = useState<SearchResult[]>([]);
   const [librarySearching, setLibrarySearching] = useState(false);
@@ -503,18 +513,67 @@ function App() {
       /* older backend */
     }
   };
-  const loadGeneralChat = async () => {
+  const loadChatSessions = async (): Promise<ChatSession[]> => {
     try {
-      setGeneralChat(await readResponse<ChatMessage[]>(await fetch(`${API}/chat`)));
+      const rows = await readResponse<ChatSession[]>(await fetch(`${API}/chat/sessions`));
+      setChatSessions(rows);
+      return rows;
     } catch {
-      /* older backend */
+      return [];
     }
+  };
+  const loadGeneralChat = async (sessionId: number) => {
+    try {
+      setGeneralChat(await readResponse<ChatMessage[]>(
+        await fetch(`${API}/chat?session_id=${sessionId}`)));
+    } catch {
+      setGeneralChat([]);
+    }
+  };
+  const refreshChatSessions = async () => {
+    try {
+      setChatSessions(await readResponse<ChatSession[]>(await fetch(`${API}/chat/sessions`)));
+    } catch {
+      /* 列表刷新失败不影响当前对话 */
+    }
+  };
+  const ensureGeneralSession = async (): Promise<number> => {
+    if (activeSessionId != null) return activeSessionId;
+    const created = await readResponse<ChatSession>(
+      await fetch(`${API}/chat/sessions`, { method: "POST" }));
+    setChatSessions((rows) => [created, ...rows]);
+    setActiveSessionId(created.id);
+    return created.id;
+  };
+  const newGeneralSession = async () => {
+    if (busy) return;
+    try {
+      const created = await readResponse<ChatSession>(
+        await fetch(`${API}/chat/sessions`, { method: "POST" }));
+      setChatSessions((rows) => [created, ...rows]);
+      setActiveSessionId(created.id);
+      setGeneralChat([]);
+      setGeneralQuestion("");
+    } catch (error) {
+      setNotice(`新建会话失败：${reasonOf(error)}`);
+    }
+  };
+  const selectGeneralSession = async (sessionId: number) => {
+    if (busy || sessionId === activeSessionId) return;
+    setActiveSessionId(sessionId);
+    setGeneralQuestion("");
+    await loadGeneralChat(sessionId);
   };
 
   useEffect(() => {
     void loadPapers();
     void loadSettings();
-    void loadGeneralChat();
+    void (async () => {
+      const rows = await loadChatSessions();
+      const latest = rows[0]?.id ?? null;
+      setActiveSessionId(latest);
+      if (latest != null) await loadGeneralChat(latest);
+    })();
   }, []);
 
   useEffect(() => {
@@ -700,6 +759,7 @@ function App() {
     retry: boolean,
     paperId: number | undefined,
     setMessages: Dispatch<SetStateAction<ChatMessage[]>>,
+    sessionId?: number,
   ) => {
     agentAbort.current?.abort();
     const controller = new AbortController();
@@ -710,7 +770,10 @@ function App() {
       const response = await fetch(`${API}/agent/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: content, mode, paper_id: paperId, stream: true, retry }),
+        body: JSON.stringify({
+          message: content, mode, paper_id: paperId, stream: true, retry,
+          session_id: sessionId,
+        }),
         signal: controller.signal,
       });
       if (!response.ok) throw new Error(await readError(response));
@@ -805,12 +868,19 @@ function App() {
 
   const askGeneral = async (event: FormEvent) => {
     event.preventDefault();
-    if (!generalQuestion.trim()) return;
+    if (!generalQuestion.trim() || busy) return;
     const content = generalQuestion;
     const mode: GeneralMode = papers.length > 0 ? generalMode : "general";
-    setGeneralChat((messages) => [...messages, { role: "user", content }]);
-    setGeneralQuestion("");
-    await runAgent(mode, content, false, undefined, setGeneralChat);
+    try {
+      const sessionId = await ensureGeneralSession();
+      setGeneralQuestion("");
+      setGeneralChat((messages) => [...messages, { role: "user", content }]);
+      await runAgent(mode, content, false, undefined, setGeneralChat, sessionId);
+    } catch (error) {
+      setNotice(`提问失败：${reasonOf(error)}`);
+    } finally {
+      await refreshChatSessions();
+    }
   };
 
   const retryGeneral = async () => {
@@ -819,7 +889,14 @@ function App() {
     const content = generalChat[lastUser].content;
     const mode: GeneralMode = papers.length > 0 ? generalMode : "general";
     setGeneralChat((messages) => messages.slice(0, lastUser + 1));
-    await runAgent(mode, content, true, undefined, setGeneralChat);
+    try {
+      const sessionId = await ensureGeneralSession();
+      await runAgent(mode, content, true, undefined, setGeneralChat, sessionId);
+    } catch (error) {
+      setNotice(`重试失败：${reasonOf(error)}`);
+    } finally {
+      await refreshChatSessions();
+    }
   };
 
   const remove = async () => {
@@ -909,10 +986,10 @@ function App() {
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <span className="brand-mark">P</span>
+          <span className="brand-mark">觅</span>
           <div>
-            <span className="eyebrow">PAPER READER</span>
-            <h1>可追溯的医学论文精读</h1>
+            <span className="eyebrow">HEARTSEEKER_MED</span>
+            <h1>觅心 · 可追溯的医学论文精读</h1>
           </div>
         </div>
         <label className="import-button">
@@ -923,8 +1000,11 @@ function App() {
       {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice("")}>×</button></div>}
       <div className="layout">
         <nav className="nav">
+          <button className={tab === "chat" ? "nav-active" : ""} onClick={() => setTab("chat")}>
+            ◈ <span>主对话 · 通用医学</span>
+          </button>
           <button className={tab === "library" ? "nav-active" : ""} onClick={() => setTab("library")}>
-            ◫ <span>论文库</span>
+            ◫ <span>论文库 · 全库检索</span>
           </button>
           {selected && (
             <button className={tab === "reader" ? "nav-active" : ""} onClick={() => setTab("reader")}>
@@ -937,35 +1017,39 @@ function App() {
           <div className="nav-foot">本地优先<br /><small>数据不会自动上传</small></div>
         </nav>
         <main className="main">
+          {tab === "chat" && (
+            <GeneralChat
+              chat={generalChat}
+              question={generalQuestion}
+              setQuestion={setGeneralQuestion}
+              ask={askGeneral}
+              busy={busy}
+              onStop={stopAgent}
+              onRetry={() => void retryGeneral()}
+              mode={generalMode}
+              setMode={setGeneralMode}
+              hasPapers={papers.length > 0}
+              onJump={jumpTo}
+              sessions={chatSessions}
+              activeSessionId={activeSessionId}
+              onSelectSession={(id) => void selectGeneralSession(id)}
+              onNewSession={() => void newGeneralSession()}
+            />
+          )}
           {tab === "library" && (
-            <>
-              <GeneralChat
-                chat={generalChat}
-                question={generalQuestion}
-                setQuestion={setGeneralQuestion}
-                ask={askGeneral}
-                busy={busy}
-                onStop={stopAgent}
-                onRetry={() => void retryGeneral()}
-                mode={generalMode}
-                setMode={setGeneralMode}
-                hasPapers={papers.length > 0}
-                onJump={jumpTo}
-              />
-              <Library
-                papers={papers}
-                selected={selected}
-                onSelect={(id) => void selectPaper(id)}
-                onImport={importFile}
-                importing={importing}
-                libraryQuery={libraryQuery}
-                setLibraryQuery={setLibraryQuery}
-                libraryResults={libraryResults}
-                librarySearching={librarySearching}
-                onSearch={() => void searchLibrary()}
-                onOpenResult={(result) => jumpTo(result.page_number, result.paper_id, bboxOf(result))}
-              />
-            </>
+            <Library
+              papers={papers}
+              selected={selected}
+              onSelect={(id) => void selectPaper(id)}
+              onImport={importFile}
+              importing={importing}
+              libraryQuery={libraryQuery}
+              setLibraryQuery={setLibraryQuery}
+              libraryResults={libraryResults}
+              librarySearching={librarySearching}
+              onSearch={() => void searchLibrary()}
+              onOpenResult={(result) => jumpTo(result.page_number, result.paper_id, bboxOf(result))}
+            />
           )}
           {tab === "settings" && (
             <SettingsView
@@ -1030,6 +1114,10 @@ function GeneralChat({
   setMode,
   hasPapers,
   onJump,
+  sessions,
+  activeSessionId,
+  onSelectSession,
+  onNewSession,
 }: {
   chat: ChatMessage[];
   question: string;
@@ -1042,7 +1130,35 @@ function GeneralChat({
   setMode: (mode: GeneralMode) => void;
   hasPapers: boolean;
   onJump: JumpHandler;
+  sessions: ChatSession[];
+  activeSessionId: number | null;
+  onSelectSession: (sessionId: number) => void;
+  onNewSession: () => void;
 }) {
+  const messagesRef = useRef<HTMLDivElement>(null);
+  const stickToBottom = useRef(true);
+
+  // Entering the tab remounts this component, so the effect lands on the
+  // newest message every time.  While reading, streaming updates only follow
+  // the bottom when the user has not scrolled away.
+  useLayoutEffect(() => {
+    const container = messagesRef.current;
+    if (!container || !stickToBottom.current) return;
+    container.scrollTop = container.scrollHeight;
+  }, [chat]);
+
+  const handleMessagesScroll = () => {
+    const container = messagesRef.current;
+    if (!container) return;
+    stickToBottom.current =
+      container.scrollHeight - container.scrollTop - container.clientHeight < 40;
+  };
+
+  const submit = (event: FormEvent) => {
+    stickToBottom.current = true;
+    ask(event);
+  };
+
   return (
     <section className="general-chat">
       <div className="chat-intro">
@@ -1068,7 +1184,31 @@ function GeneralChat({
           {!hasPapers && <small>导入论文后可启用库内检索</small>}
         </div>
       </div>
-      <div className="messages general-messages">
+      <div className="session-bar">
+        <label>
+          <span className="eyebrow">会话记忆</span>
+          <select
+            value={activeSessionId ?? ""}
+            onChange={(event) => {
+              const value = Number(event.target.value);
+              if (value) onSelectSession(value);
+            }}
+            disabled={busy}
+          >
+            {activeSessionId == null && <option value="">新会话</option>}
+            {sessions.map((session) => (
+              <option key={session.id} value={session.id}>
+                {session.title || `未命名会话 #${session.id}`}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button type="button" onClick={onNewSession} disabled={busy}>
+          ＋ 新会话
+        </button>
+        <small>每个会话独立保留上下文，切换会话不会混用对话记忆。</small>
+      </div>
+      <div className="messages general-messages" ref={messagesRef} onScroll={handleMessagesScroll}>
         {chat.length ? chat.map((message, index) => (
           <MessageView key={message.id || index} message={message} onJump={onJump} onRetry={onRetry} />
         )) : (
@@ -1078,7 +1218,7 @@ function GeneralChat({
           </div>
         )}
       </div>
-      <form className="question-form" onSubmit={ask}>
+      <form className="question-form" onSubmit={submit}>
         <input
           value={question}
           onChange={(event) => setQuestion(event.target.value)}
@@ -2007,7 +2147,7 @@ function SettingsView({
       </form>
       <div className="data-card">
         <h3>本地数据</h3>
-        <p>数据目录：<code>{settings.data_dir || "默认用户目录\\PaperReader"}</code></p>
+        <p>数据目录：<code>{settings.data_dir || "默认用户目录\\HeartSeeker_Med"}</code></p>
         <p>包含原始 PDF、SQLite 数据库、解析缓存、LanceDB 向量索引和问答历史。</p>
       </div>
     </section>

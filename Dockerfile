@@ -1,6 +1,6 @@
 # Single-process local deployment: FastAPI serves the built frontend.
-# Build:  docker build -t paper-reader .
-# Run:    docker run --rm -p 8765:8765 -v paper-reader-data:/data paper-reader
+# Build:  docker build -t heartseeker-med .
+# Run:    docker run --rm -p 8765:8765 -v heartseeker-med-data:/data heartseeker-med
 
 FROM node:20-alpine AS frontend
 WORKDIR /app
@@ -12,7 +12,7 @@ FROM python:3.12-slim
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PAPER_READER_HOME=/data
+    HEARTSEEKER_MED_HOME=/data
 COPY backend/requirements.txt backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 COPY backend ./backend

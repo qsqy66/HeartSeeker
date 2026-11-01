@@ -9,7 +9,7 @@ Two modes:
 
 * live run against a local library (needs a configured chat model)::
 
-      python scripts/evaluate_answers.py --db ~/PaperReader/database/paper_reader.sqlite3 \\
+      python scripts/evaluate_answers.py --db ~/HeartSeeker_Med/database/heartseeker_med.sqlite3 \\
           --provider ollama --model qwen2.5:7b
 
 Use ``--offline`` with live mode to build a temporary library from
@@ -91,7 +91,7 @@ def _print_report(report: dict[str, Any]) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Paper Reader answer-level evaluation")
+    parser = argparse.ArgumentParser(description="觅心（HeartSeeker_Med） answer-level evaluation")
     parser.add_argument("--dataset", type=Path,
                         default=ROOT / "eval" / "answer_cases.json")
     parser.add_argument("--answers", type=Path, default=None,
@@ -132,7 +132,7 @@ def main() -> int:
         if args.db is None and not args.offline:
             parser.error("活体评测需要 --db 或 --offline（或提供 --answers）")
         if args.offline:
-            temp = tempfile.TemporaryDirectory(prefix="paper-reader-answer-eval-")
+            temp = tempfile.TemporaryDirectory(prefix="heartseeker-med-answer-eval-")
             db_path, vectors_dir = evaluation.build_fixture(args.corpus, temp.name)
         else:
             db_path = args.db

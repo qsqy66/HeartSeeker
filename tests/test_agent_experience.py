@@ -348,7 +348,7 @@ class ExportApiTestCase(_TempDatabase):
         response = self._get("/api/agent/runs/1/export?format=md")
         self.assertEqual(response.status_code, 200)
         self.assertIn("text/markdown", response.headers["content-type"])
-        self.assertIn("attachment; filename=\"paper-reader-run-1.md\"",
+        self.assertIn("attachment; filename=\"heartseeker-med-run-1.md\"",
                       response.headers["content-disposition"])
         self.assertIn("## 回答", response.text)
         self.assertIn("含\\|竖线", response.text)

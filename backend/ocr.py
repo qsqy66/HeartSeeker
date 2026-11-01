@@ -8,7 +8,7 @@ an import.
 
 Resolution order for ``engine="auto"``:
 
-1. ``PAPER_READER_OCR_ENGINE`` environment variable
+1. ``HEARTSEEKER_MED_OCR_ENGINE`` (or legacy ``PAPER_READER_OCR_ENGINE``)
 2. RapidOCR (``rapidocr_onnxruntime`` or ``rapidocr``), if importable
 3. Tesseract CLI (``tesseract`` on PATH or ``TESSERACT_BIN``)
 
@@ -28,12 +28,17 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional, Protocol, runtime_checkable
 
-DEFAULT_LANG = os.environ.get("PAPER_READER_OCR_LANG", "chi_sim+eng")
-DEFAULT_DPI = int(os.environ.get("PAPER_READER_OCR_DPI", "220"))
+DEFAULT_LANG = (os.environ.get("HEARTSEEKER_MED_OCR_LANG")
+                or os.environ.get("PAPER_READER_OCR_LANG", "chi_sim+eng"))
+DEFAULT_DPI = int(os.environ.get("HEARTSEEKER_MED_OCR_DPI")
+                  or os.environ.get("PAPER_READER_OCR_DPI", "220"))
 MIN_PAGE_CHARS = 20
-DEFAULT_ALIYUN_ENDPOINT = os.environ.get(
-    "PAPER_READER_ALIYUN_OCR_ENDPOINT", "ocr-api.cn-hangzhou.aliyuncs.com")
-DEFAULT_ALIYUN_OCR_TYPE = os.environ.get("PAPER_READER_ALIYUN_OCR_TYPE", "Advanced")
+DEFAULT_ALIYUN_ENDPOINT = (os.environ.get("HEARTSEEKER_MED_ALIYUN_OCR_ENDPOINT")
+                           or os.environ.get(
+                               "PAPER_READER_ALIYUN_OCR_ENDPOINT",
+                               "ocr-api.cn-hangzhou.aliyuncs.com"))
+DEFAULT_ALIYUN_OCR_TYPE = (os.environ.get("HEARTSEEKER_MED_ALIYUN_OCR_TYPE")
+                           or os.environ.get("PAPER_READER_ALIYUN_OCR_TYPE", "Advanced"))
 ALIYUN_OCR_KEY = "aliyun-ocr"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 ALIYUN_OCR_TYPES = {"General", "Advanced", "MultiLang"}
@@ -252,7 +257,9 @@ def get_engine(name: Optional[str] = None) -> OcrEngine:
 
     ``name`` may be ``auto``/``none``/``tesseract``/``rapidocr``/``aliyun``.
     """
-    selected = (name or os.environ.get("PAPER_READER_OCR_ENGINE") or "auto").strip().lower()
+    selected = (name
+                or os.environ.get("HEARTSEEKER_MED_OCR_ENGINE")
+                or os.environ.get("PAPER_READER_OCR_ENGINE") or "auto").strip().lower()
     if selected == "none":
         return NullEngine()
     if selected == "tesseract":

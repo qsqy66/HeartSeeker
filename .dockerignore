@@ -5,4 +5,5 @@ dist
 __pycache__
 *.pyc
 PaperReader
+HeartSeeker_Med
 data

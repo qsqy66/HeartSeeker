@@ -38,7 +38,7 @@ def build_fixture(corpus_path: Path | str, app_home: Path | str) -> tuple[Path, 
     corpus = _load_json(corpus_path)
     papers = corpus.get("papers", []) if isinstance(corpus, dict) else []
     home = Path(app_home)
-    db_path = home / "database" / "paper_reader.sqlite3"
+    db_path = home / "database" / "heartseeker_med.sqlite3"
     vectors_dir = home / "vectors"
     initialize_storage(app_home=home, db_path=db_path,
                        papers_dir=home / "papers", vectors_dir=vectors_dir)
@@ -281,7 +281,7 @@ def evaluate(dataset_path: Path | str, db_path: Path | str, vectors_dir: Path | 
 
 def evaluate_offline(corpus_path: Path | str, dataset_path: Path | str,
                      top_k: int = 8) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="paper-reader-eval-") as temp:
+    with tempfile.TemporaryDirectory(prefix="heartseeker-med-eval-") as temp:
         db_path, vectors_dir = build_fixture(corpus_path, temp)
         return evaluate(dataset_path, db_path, vectors_dir, top_k=top_k,
                         enable_vectors=False, mode="offline")

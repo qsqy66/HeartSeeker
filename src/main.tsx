@@ -154,6 +154,7 @@ type Settings = {
   ocr_type: string;
   ocr_access_key_id: string;
   ocr_key_configured: boolean;
+  ocr_env_configured: boolean;
   ocr_available: string;
   rerank_enabled: string;
   rerank_engine: string;
@@ -454,6 +455,7 @@ function App() {
     ocr_type: "Advanced",
     ocr_access_key_id: "",
     ocr_key_configured: false,
+    ocr_env_configured: false,
     ocr_available: "",
     rerank_enabled: "true",
     rerank_engine: "lexical",
@@ -1787,6 +1789,11 @@ function SettingsView({
               <small className="field-help">
                 Secret 不写入数据库或日志；也可用 ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET 环境变量。
               </small>
+              {settings.ocr_env_configured && (
+                <small className="field-help">
+                  已检测到环境变量 AccessKey；留空上方 AccessKey ID/Secret 时将使用环境变量。
+                </small>
+              )}
             </label>
             <label>
               阿里云 OCR Endpoint

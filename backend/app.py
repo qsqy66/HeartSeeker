@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -1140,6 +1141,10 @@ def _settings_payload(values: dict[str, str]) -> dict[str, Any]:
         "ocr_type": values.get("ocr_type", ocr_module.DEFAULT_ALIYUN_OCR_TYPE),
         "ocr_access_key_id": values.get("ocr_access_key_id", ""),
         "ocr_key_configured": bool(safe_key(ocr_module.ALIYUN_OCR_KEY)),
+        "ocr_env_configured": bool(
+            os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID")
+            and os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
+        ),
         "ocr_available": _ocr_available(values.get("ocr_engine", "auto"), values),
         "rerank_enabled": values.get("rerank_enabled", "true"),
         "rerank_engine": values.get("rerank_engine", "lexical"),

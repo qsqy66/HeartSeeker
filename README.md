@@ -70,7 +70,21 @@
   }
   ```
 
-  建议只使用程序访问并定期轮换。也可用 `ALIBABA_CLOUD_ACCESS_KEY_ID` / `ALIBABA_CLOUD_ACCESS_KEY_SECRET` 环境变量。
+  建议只使用程序访问并定期轮换。
+
+- 推荐用环境变量保存 AccessKey，设置页的 AccessKey ID / Secret 留空即可：
+
+  ```bash
+  # Linux / macOS（写入 shell 配置后重新打开终端）
+  export ALIBABA_CLOUD_ACCESS_KEY_ID="<access_key_id>"
+  export ALIBABA_CLOUD_ACCESS_KEY_SECRET="<access_key_secret>"
+
+  # Windows CMD（永久，需新开窗口）
+  setx ALIBABA_CLOUD_ACCESS_KEY_ID "<access_key_id>"
+  setx ALIBABA_CLOUD_ACCESS_KEY_SECRET "<access_key_secret>"
+  ```
+
+  若设置页也填写了凭据，则优先使用设置页的值（Secret 存在系统凭据库）；两者都未配置时阿里云 OCR 不可用。
 - Endpoint 填公网接入地址（如 `ocr-api.cn-hangzhou.aliyuncs.com`）或同地域 VPC 地址（`ocr-api-vpc.cn-hangzhou.aliyuncs.com`）。SDK 会自动完成 RPC HMAC-SHA1 签名，无需手工拼签名参数。
 - 阿里云 OCR 会将被识别页面的 PNG 上传到云端并按调用量计费。图像需小于 10MB、宽高 15–8192 像素、长宽比小于 50；超限页面会自动降低渲染 DPI，仍超限则该页记录 OCR 失败。
 - 引擎选择、语言（默认 `chi_sim+eng`）和渲染 DPI（默认 220）可在设置页调整，也可用 `PAPER_READER_OCR_ENGINE` / `PAPER_READER_OCR_LANG` / `PAPER_READER_OCR_DPI` 覆盖；阿里云 Endpoint/类型可用 `PAPER_READER_ALIYUN_OCR_ENDPOINT` / `PAPER_READER_ALIYUN_OCR_TYPE` 覆盖。

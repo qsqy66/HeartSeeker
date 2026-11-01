@@ -697,6 +697,33 @@ class AgentRunner:
             return call
         return None
 
+    def _repair_empty_answer(self, messages: list[dict[str, str]],
+                             args: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Ask once for a non-empty finish when the model submits empty args."""
+        repair = (
+            "上一条 finish 的 answer 为空。请只输出一个 JSON 对象，tool 为 finish，"
+            "args.answer 为完整回答，并附上 citations。citations 中的 quote 必须逐字"
+            "复制自工具 Observation 中出现过的原文，page 必须与证据页码一致。"
+        )
+        try:
+            prompt = token_budget.fit_messages(
+                [*messages,
+                 {"role": "assistant",
+                  "content": json.dumps({"thought": "", "tool": "finish", "args": args},
+                                        ensure_ascii=False)[:2000]},
+                 {"role": "user", "content": repair}],
+                self.config.max_context_tokens,
+            )
+            raw = self.chat_fn(prompt)
+        except providers.ProviderError:
+            return None
+        call = providers.extract_json_object(raw)
+        if not call or call.get("tool") != "finish" or not isinstance(call.get("args"), dict):
+            return None
+        if not str(call["args"].get("answer") or "").strip():
+            return None
+        return call
+
     def _fallback(self, reason: str) -> tuple[str, list[dict[str, Any]]]:
         rows = [row for row in self.evidence if row.get("text", "").strip()][:6]
         if not rows:
@@ -716,6 +743,13 @@ class AgentRunner:
         raw_citations = args.get("citations")
         if not isinstance(raw_citations, list):
             raw_citations = []
+        if not answer:
+            repaired_call = self._repair_empty_answer(messages, args)
+            if repaired_call:
+                answer = str(repaired_call["args"].get("answer") or "").strip()
+                repaired_citations = repaired_call["args"].get("citations")
+                if isinstance(repaired_citations, list):
+                    raw_citations = repaired_citations
         require_citation = self.config.mode == "paper"
         judge = self._nli_judge()
         validation = validate_citations(

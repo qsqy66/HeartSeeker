@@ -32,6 +32,23 @@ class ClaimVerificationTestCase(unittest.TestCase):
         self.assertFalse(support.supported)
         self.assertTrue(support.contradiction)
 
+    def test_nonsense_variant_is_not_treated_as_negation(self) -> None:
+        support = verification.verify_claim(
+            "无义变异位置与疾病临床严重程度相关",
+            "Our findings suggest a novel association between the location of "
+            "nonsense variants and the clinical severity of the disease.",
+        )
+        self.assertTrue(support.supported)
+        self.assertFalse(support.contradiction)
+
+    def test_cross_language_negation_is_not_judged_by_keyword(self) -> None:
+        support = verification.verify_claim(
+            "作者说明该相关性远不穷尽",
+            "this is far from exhaustive",
+        )
+        self.assertFalse(support.contradiction)
+        self.assertTrue(support.supported)
+
     def test_cross_language_claim_is_not_penalized_for_coverage(self) -> None:
         support = verification.verify_claim(
             "主要终点为 12 个月全因死亡",

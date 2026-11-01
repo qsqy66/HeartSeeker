@@ -27,7 +27,7 @@ CJK_RE = re.compile(r"[㐀-鿿]")
 NEGATION_RE = re.compile(
     r"\b(?:not|no|never|without|neither|nor|failed\s+to|did\s+not|didn't|"
     r"does\s+not|doesn't|was\s+not|were\s+not|no\s+significant)\b"
-    r"|未|无|不|没有|并非|未能|不能|未见",
+    r"|未|无(?!义)|不|没有|并非|未能|不能|未见",
     re.IGNORECASE,
 )
 STOPWORDS = {
@@ -196,7 +196,10 @@ def verify_claim(claim: str, quote: str, judge: Optional[NliJudge] = None,
         contradiction = True
         score = 0.1
 
-    if _has_negation(claim) != _has_negation(quote):
+    # Negation lexicons are language-specific; comparing a Chinese claim with
+    # an English quote produces false contradictions (e.g. 无义变异 / nonsense,
+    # 不穷尽 / far from exhaustive).  Only apply this check within one language.
+    if same_language and _has_negation(claim) != _has_negation(quote):
         reasons.append("论断与引文的否定/肯定方向不一致")
         contradiction = True
         score = min(score, 0.15)

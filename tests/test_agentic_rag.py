@@ -176,6 +176,33 @@ class AgenticRagTestCase(unittest.TestCase):
         result = self._runner([search, bad_finish, good_finish]).run("主要终点是什么？")
         self.assertTrue(result["verified"])
 
+    def test_agent_retries_empty_finish_answer(self) -> None:
+        search = json.dumps({
+            "thought": "先检索",
+            "tool": "search_library",
+            "args": {"query": "primary outcome", "top_k": 3},
+        }, ensure_ascii=False)
+        empty_finish = json.dumps({
+            "thought": "准备回答",
+            "tool": "finish",
+            "args": {},
+        }, ensure_ascii=False)
+        good_finish = json.dumps({
+            "thought": "补全回答",
+            "tool": "finish",
+            "args": {
+                "answer": "主要终点是 12 个月全因死亡 [Page 1]。",
+                "citations": [{
+                    "paper_id": 1, "page": 1,
+                    "quote": "The primary outcome was all-cause mortality at 12 months.",
+                    "claim": "主要终点为 12 个月全因死亡",
+                }],
+            },
+        }, ensure_ascii=False)
+        result = self._runner([search, empty_finish, good_finish]).run("主要终点是什么？")
+        self.assertTrue(result["verified"])
+        self.assertIn("12 个月", result["content"])
+
     def test_agent_falls_back_when_no_citation(self) -> None:
         search = json.dumps({
             "thought": "先检索",

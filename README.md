@@ -1,5 +1,7 @@
 # 觅心（HeartSeeker_Med）— 本地优先的医学论文 Agentic RAG
 
+[![CI](https://github.com/qsqy66/SL_Med/actions/workflows/ci.yml/badge.svg)](https://github.com/qsqy66/SL_Med/actions/workflows/ci.yml)
+
 面向医学生和临床研究者的论文精读助手。导入 PDF 后，在本机完成解析、混合检索与可核验问答；数据默认只存本机，只有主动使用模型功能时才向远端供应商发送必要的文本片段。
 
 问答与嵌入仍使用远端模型；检索索引、原文、向量和问答历史全部落在本机。OCR、重排和论断蕴含校验预留了可选本地模型接口，默认使用无需模型的本地词法/规则实现。问答模型支持 OpenAI、DeepSeek、Qwen、Anthropic Claude、Google Gemini、Moonshot、智谱、SiliconFlow、OpenRouter、Groq、Mistral、Ollama 以及自定义网关；供应商按 **OpenAI 兼容 / Anthropic Messages / Gemini** 三种协议适配，新增同协议厂商只需增加配置。

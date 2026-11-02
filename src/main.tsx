@@ -564,6 +564,40 @@ function App() {
     setGeneralQuestion("");
     await loadGeneralChat(sessionId);
   };
+  const renameGeneralSession = async (sessionId: number, title: string) => {
+    const cleaned = title.trim().slice(0, 80);
+    if (!cleaned || busy) return;
+    try {
+      const updated = await readResponse<ChatSession>(await fetch(
+        `${API}/chat/sessions/${sessionId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: cleaned }),
+        }));
+      setChatSessions((rows) => rows.map(
+        (row) => (row.id === sessionId ? { ...row, ...updated } : row)));
+    } catch (error) {
+      setNotice(`重命名失败：${reasonOf(error)}`);
+    }
+  };
+  const deleteGeneralSession = async (sessionId: number) => {
+    if (busy) return;
+    try {
+      await readResponse(await fetch(`${API}/chat/sessions/${sessionId}`, { method: "DELETE" }));
+      const remaining = chatSessions.filter((row) => row.id !== sessionId);
+      setChatSessions(remaining);
+      if (activeSessionId === sessionId) {
+        const next = remaining[0]?.id ?? null;
+        setActiveSessionId(next);
+        setGeneralQuestion("");
+        if (next != null) await loadGeneralChat(next);
+        else setGeneralChat([]);
+      }
+      setNotice("会话已删除。");
+    } catch (error) {
+      setNotice(`删除会话失败：${reasonOf(error)}`);
+    }
+  };
 
   useEffect(() => {
     void loadPapers();
@@ -1034,6 +1068,8 @@ function App() {
               activeSessionId={activeSessionId}
               onSelectSession={(id) => void selectGeneralSession(id)}
               onNewSession={() => void newGeneralSession()}
+              onRenameSession={(id, title) => void renameGeneralSession(id, title)}
+              onDeleteSession={(id) => void deleteGeneralSession(id)}
             />
           )}
           {tab === "library" && (
@@ -1118,6 +1154,8 @@ function GeneralChat({
   activeSessionId,
   onSelectSession,
   onNewSession,
+  onRenameSession,
+  onDeleteSession,
 }: {
   chat: ChatMessage[];
   question: string;
@@ -1134,6 +1172,8 @@ function GeneralChat({
   activeSessionId: number | null;
   onSelectSession: (sessionId: number) => void;
   onNewSession: () => void;
+  onRenameSession: (sessionId: number, title: string) => void;
+  onDeleteSession: (sessionId: number) => void;
 }) {
   const messagesRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
@@ -1157,6 +1197,20 @@ function GeneralChat({
   const submit = (event: FormEvent) => {
     stickToBottom.current = true;
     ask(event);
+  };
+
+  const activeSession = sessions.find((session) => session.id === activeSessionId) ?? null;
+  const renameSession = () => {
+    if (activeSessionId == null || busy) return;
+    const title = window.prompt("重命名会话", activeSession?.title || "");
+    if (title == null || !title.trim()) return;
+    onRenameSession(activeSessionId, title);
+  };
+  const deleteSession = () => {
+    if (activeSessionId == null || busy) return;
+    const label = activeSession?.title || `未命名会话 #${activeSessionId}`;
+    if (!window.confirm(`删除会话「${label}」及其全部消息？`)) return;
+    onDeleteSession(activeSessionId);
   };
 
   return (
@@ -1206,7 +1260,15 @@ function GeneralChat({
         <button type="button" onClick={onNewSession} disabled={busy}>
           ＋ 新会话
         </button>
-        <small>每个会话独立保留上下文，切换会话不会混用对话记忆。</small>
+        <button type="button" onClick={renameSession}
+          disabled={busy || activeSessionId == null}>
+          重命名
+        </button>
+        <button type="button" className="danger" onClick={deleteSession}
+          disabled={busy || activeSessionId == null}>
+          删除会话
+        </button>
+        <small>每个会话独立保留上下文；首条提问会取前四十个字生成名称，之后可手动重命名。</small>
       </div>
       <div className="messages general-messages" ref={messagesRef} onScroll={handleMessagesScroll}>
         {chat.length ? chat.map((message, index) => (

@@ -77,6 +77,71 @@ class ChatSessionTestCase(unittest.TestCase):
         self.assertEqual(sessions[0]["title"], "急性心衰的治疗原则？")
         self.assertEqual(sessions[0]["message_count"], 2)
 
+    def test_long_first_question_is_clipped_to_forty_characters_once(self) -> None:
+        session_id = self._create_session()
+        question = (
+            "急性心力衰竭患者长期治疗方案及药物剂量调整与随访要点分别是什么？"
+            "请详细说明具体方案"
+        )
+        self.assertGreater(len(question), 40)
+        app_module._store_agent_message(
+            "general", None, "user", question, "test", session_id)
+
+        sessions = self.client.get("/api/chat/sessions").json()
+        self.assertEqual(sessions[0]["title"], question[:40] + "...")
+
+        # Later questions never rewrite an existing title automatically.
+        app_module._store_agent_message(
+            "general", None, "user", "那药物剂量如何调整？", "test", session_id)
+        sessions = self.client.get("/api/chat/sessions").json()
+        self.assertEqual(sessions[0]["title"], question[:40] + "...")
+
+    def test_manual_rename_is_kept_and_delete_removes_messages(self) -> None:
+        session_id = self._create_session()
+        app_module._store_agent_message(
+            "general", None, "user", "第一个问题", "test", session_id)
+        app_module._store_agent_message(
+            "general", None, "assistant", "第一个回答", "test", session_id)
+
+        renamed = self.client.patch(
+            f"/api/chat/sessions/{session_id}", json={"title": "  心衰专题  "})
+        self.assertEqual(renamed.status_code, 200)
+        self.assertEqual(renamed.json()["title"], "心衰专题")
+        self.assertEqual(renamed.json()["message_count"], 2)
+
+        app_module._store_agent_message(
+            "general", None, "user", "后续问题不会自动改名", "test", session_id)
+        sessions = self.client.get("/api/chat/sessions").json()
+        self.assertEqual(sessions[0]["title"], "心衰专题")
+
+        with storage.get_connection(self.db) as connection:
+            connection.execute(
+                "INSERT INTO general_session_summaries(session_id,summary,summarized_upto,"
+                "updated_at) VALUES(?,?,?,?)",
+                (session_id, "摘要", 1, "2026-01-01T00:00:00"),
+            )
+
+        deleted = self.client.delete(f"/api/chat/sessions/{session_id}")
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(self.client.get("/api/chat/sessions").json(), [])
+        self.assertEqual(
+            self.client.get(f"/api/chat?session_id={session_id}").status_code, 404)
+        with storage.get_connection(self.db) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM general_messages WHERE session_id=?",
+                (session_id,)).fetchone()[0], 0)
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM general_session_summaries WHERE session_id=?",
+                (session_id,)).fetchone()[0], 0)
+
+    def test_rename_and_delete_validation(self) -> None:
+        session_id = self._create_session()
+        self.assertEqual(self.client.patch(
+            f"/api/chat/sessions/{session_id}", json={"title": "   "}).status_code, 400)
+        self.assertEqual(self.client.patch(
+            "/api/chat/sessions/999999", json={"title": "不存在"}).status_code, 404)
+        self.assertEqual(self.client.delete("/api/chat/sessions/999999").status_code, 404)
+
     def test_latest_session_is_the_default_and_unknown_ids_are_404(self) -> None:
         first = self._create_session()
         app_module._store_agent_message(

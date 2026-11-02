@@ -226,6 +226,10 @@ class AgentChatPayload(BaseModel):
     session_id: Optional[int] = None
 
 
+class SessionTitlePayload(BaseModel):
+    title: str = Field(min_length=1, max_length=80)
+
+
 class ModelsPayload(BaseModel):
     provider: str
     api_key: Optional[str] = None
@@ -425,7 +429,7 @@ def _resolve_chat_session(session_id: Optional[int] = None,
 
 def _session_title(message: str) -> str:
     line = next((item.strip() for item in message.splitlines() if item.strip()), "")
-    return line[:40]
+    return line[:40] + "..." if len(line) > 40 else line
 
 
 def _touch_chat_session(connection, session_id: int, title: str = "") -> None:
@@ -1580,6 +1584,44 @@ def create_general_chat_session() -> dict[str, Any]:
         )
     return {"id": cursor.lastrowid, "title": "", "created_at": now,
             "updated_at": now, "message_count": 0}
+
+
+@app.patch("/api/chat/sessions/{session_id}")
+def rename_general_chat_session(session_id: int,
+                                payload: SessionTitlePayload) -> dict[str, Any]:
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(400, "会话标题不能为空")
+    with get_connection() as connection:
+        if connection.execute(
+                "SELECT 1 FROM general_sessions WHERE id=?", (session_id,)
+        ).fetchone() is None:
+            raise HTTPException(404, "会话不存在")
+        connection.execute(
+            "UPDATE general_sessions SET title=? WHERE id=?", (title, session_id))
+        row = connection.execute(
+            "SELECT s.id, s.title, s.created_at, s.updated_at, COUNT(m.id) AS message_count "
+            "FROM general_sessions s "
+            "LEFT JOIN general_messages m ON m.session_id = s.id "
+            "WHERE s.id=? GROUP BY s.id",
+            (session_id,),
+        ).fetchone()
+    return dict(row)
+
+
+@app.delete("/api/chat/sessions/{session_id}")
+def delete_general_chat_session(session_id: int) -> dict[str, Any]:
+    with get_connection() as connection:
+        if connection.execute(
+                "SELECT 1 FROM general_sessions WHERE id=?", (session_id,)
+        ).fetchone() is None:
+            raise HTTPException(404, "会话不存在")
+        connection.execute(
+            "DELETE FROM general_messages WHERE session_id=?", (session_id,))
+        connection.execute(
+            "DELETE FROM general_session_summaries WHERE session_id=?", (session_id,))
+        connection.execute("DELETE FROM general_sessions WHERE id=?", (session_id,))
+    return {"id": session_id, "status": "deleted"}
 
 
 @app.get("/api/chat")

@@ -101,6 +101,43 @@ type ChatSession = {
   updated_at: string;
   message_count: number;
 };
+type UsageStats = {
+  tokens: {
+    calls: number;
+    prompt: number;
+    completion: number;
+    total: number;
+    estimated_calls: number;
+    today_calls: number;
+    today_total: number;
+  };
+  runs: {
+    total: number;
+    today_runs: number;
+    verified: number;
+    avg_steps: number;
+    modes: { mode: string; count: number }[];
+  };
+  tools: { total: number; by_tool: { tool: string; count: number }[] };
+  models: {
+    provider: string;
+    model: string;
+    calls: number;
+    total_tokens: number;
+    estimated_calls: number;
+  }[];
+  sessions: { total: number; messages: number };
+  papers: { total: number; needs_ocr: number; vectorized: number };
+};
+type LogEvent = {
+  seq: number;
+  time: string;
+  level: string;
+  logger: string;
+  message: string;
+  event?: string;
+  [key: string]: unknown;
+};
 type AgentDone = {
   id?: number;
   content?: string;
@@ -335,7 +372,7 @@ function AgentTrace({ message }: { message: ChatMessage }) {
     <details className="trace" open={Boolean(message.pending)}>
       <summary>
         <span>执行轨迹 · {steps.length} 步</span>
-        {message.verified != null && (
+        {message.verified != null && (message.citations?.length ?? 0) > 0 && (
           <em className={message.verified ? "verified" : "unverified"}>
             {message.verified ? "引用已核验" : "引用未核验"}
           </em>
@@ -393,6 +430,18 @@ function MessageView({
   onJump: JumpHandler;
   onRetry: () => void;
 }) {
+  const citations = message.citations ?? [];
+  // Only surface evidence that actually backs a citation; retrieved chunks
+  // the model never cited are noise (especially for greetings).
+  const citedSources = (message.sources ?? []).filter((source, index, all) => {
+    const cited = citations.some((citation) =>
+      citation.page === source.page_number
+      && (citation.paper_id == null || source.paper_id == null
+        || citation.paper_id === source.paper_id));
+    if (!cited) return false;
+    return all.findIndex((other) =>
+      other.page_number === source.page_number && other.paper_id === source.paper_id) === index;
+  });
   return (
     <div className={`message ${message.role}`}>
       <span>{message.role === "user" ? "你" : "觅心"}</span>
@@ -405,9 +454,9 @@ function MessageView({
       {message.citations && message.citations.length > 0 && (
         <CitationChips citations={message.citations} onJump={onJump} />
       )}
-      {message.sources && message.sources.length > 0 && (
+      {citedSources.length > 0 && (
         <div className="source-list">
-          {message.sources.map((source) => (
+          {citedSources.map((source) => (
             <button
               type="button"
               className="source-chip"
@@ -434,7 +483,9 @@ function MessageView({
 function App() {
   const [papers, setPapers] = useState<Paper[]>([]);
   const [selected, setSelected] = useState<PaperDetails | null>(null);
-  const [tab, setTab] = useState<"chat" | "library" | "reader" | "settings">("chat");
+  const [tab, setTab] = useState<
+    "chat" | "library" | "reader" | "stats" | "logs" | "settings"
+  >("chat");
   const [readerTab, setReaderTab] = useState<"read" | "insights" | "chat">("read");
   const [query, setQuery] = useState("");
   const [searchMode, setSearchMode] = useState<"hybrid" | "keyword">("hybrid");
@@ -1040,6 +1091,12 @@ function App() {
           <button className={tab === "library" ? "nav-active" : ""} onClick={() => setTab("library")}>
             ◫ <span>论文库 · 全库检索</span>
           </button>
+          <button className={tab === "stats" ? "nav-active" : ""} onClick={() => setTab("stats")}>
+            ▤ <span>统计数据</span>
+          </button>
+          <button className={tab === "logs" ? "nav-active" : ""} onClick={() => setTab("logs")}>
+            ≋ <span>运行日志</span>
+          </button>
           {selected && (
             <button className={tab === "reader" ? "nav-active" : ""} onClick={() => setTab("reader")}>
               ▣ <span>论文工作台</span>
@@ -1087,6 +1144,8 @@ function App() {
               onOpenResult={(result) => jumpTo(result.page_number, result.paper_id, bboxOf(result))}
             />
           )}
+          {tab === "stats" && <StatsView />}
+          {tab === "logs" && <LogsView />}
           {tab === "settings" && (
             <SettingsView
               settings={settings}
@@ -1135,6 +1194,248 @@ function App() {
         </main>
       </div>
     </div>
+  );
+}
+
+function StatCard({ label, value, hint }: { label: string; value: string; hint: string }) {
+  return (
+    <div className="stat-card">
+      <span className="eyebrow">{label}</span>
+      <strong>{value}</strong>
+      <small>{hint}</small>
+    </div>
+  );
+}
+
+function StatsView() {
+  const [stats, setStats] = useState<UsageStats | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      setStats(await readResponse<UsageStats>(await fetch(`${API}/stats`)));
+      setError("");
+    } catch (reason) {
+      setError(reasonOf(reason));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  const number = (value?: number) => (value ?? 0).toLocaleString("zh-CN");
+  const modeNames: Record<string, string> = {
+    paper: "单篇论文",
+    library: "全库检索",
+    general: "通用医学",
+  };
+  const tokens = stats?.tokens;
+
+  return (
+    <section className="stats-view">
+      <div className="hero">
+        <div>
+          <span className="eyebrow">USAGE &amp; TELEMETRY</span>
+          <h2>统计数据</h2>
+          <p>本地累计的 token、Agent 运行与工具调用；所有记录仅保存在本机数据库。</p>
+        </div>
+        <button className="secondary" onClick={() => void load()} disabled={loading}>
+          {loading ? "刷新中…" : "刷新"}
+        </button>
+      </div>
+      {error && <div className="notice"><span>{error}</span><button onClick={() => setError("")}>×</button></div>}
+      <div className="stat-grid">
+        <StatCard label="累计 Token" value={number(tokens?.total)}
+          hint={`提示 ${number(tokens?.prompt)} · 生成 ${number(tokens?.completion)}`} />
+        <StatCard label="今日 Token" value={number(tokens?.today_total)}
+          hint={`今日 ${number(tokens?.today_calls)} 次模型调用`} />
+        <StatCard label="模型调用" value={number(tokens?.calls)}
+          hint={tokens?.estimated_calls
+            ? `其中 ${number(tokens.estimated_calls)} 次为估算值`
+            : "均由模型服务返回"} />
+        <StatCard label="Agent 运行" value={number(stats?.runs.total)}
+          hint={`今日 ${number(stats?.runs.today_runs)} 次 · 引用核验通过 ${number(stats?.runs.verified)} 次`} />
+        <StatCard label="工具调用" value={number(stats?.tools.total)}
+          hint={`平均每次运行 ${stats?.runs.avg_steps ?? 0} 步`} />
+        <StatCard label="会话消息" value={number(stats?.sessions.messages)}
+          hint={`${number(stats?.sessions.total)} 个会话`} />
+      </div>
+      <div className="stat-columns">
+        <div className="stat-panel">
+          <div className="section-heading"><h3>模型用量</h3><span>{stats?.models.length ?? 0} 个模型</span></div>
+          {stats?.models.length ? (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>供应商</th><th>模型</th><th>调用</th><th>Token</th></tr>
+                </thead>
+                <tbody>
+                  {stats.models.map((item) => (
+                    <tr key={`${item.provider}/${item.model}`}>
+                      <td>{item.provider || "—"}</td>
+                      <td>{item.model || "—"}</td>
+                      <td>{number(item.calls)}{item.estimated_calls ? `（≈${number(item.estimated_calls)}）` : ""}</td>
+                      <td>{number(item.total_tokens)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : <p className="muted">还没有模型调用记录。</p>}
+        </div>
+        <div className="stat-panel">
+          <div className="section-heading"><h3>工具调用</h3><span>共 {number(stats?.tools.total)} 次</span></div>
+          {stats?.tools.by_tool.length ? (
+            <div className="table-wrap">
+              <table>
+                <thead><tr><th>工具</th><th>次数</th></tr></thead>
+                <tbody>
+                  {stats.tools.by_tool.map((item) => (
+                    <tr key={item.tool}><td>{item.tool}</td><td>{number(item.count)}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : <p className="muted">还没有工具调用记录。</p>}
+        </div>
+      </div>
+      <div className="stat-panel">
+        <div className="section-heading">
+          <h3>运行模式与论文库</h3>
+          <span>论文 {number(stats?.papers.total)} 篇 · 已向量化 {number(stats?.papers.vectorized)} · 待 OCR {number(stats?.papers.needs_ocr)}</span>
+        </div>
+        <div className="stat-chips">
+          {stats?.runs.modes.length ? stats.runs.modes.map((item) => (
+            <span key={item.mode} className="stat-chip">
+              {modeNames[item.mode] || item.mode}<b>{number(item.count)}</b>
+            </span>
+          )) : <p className="muted">还没有 Agent 运行记录。</p>}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function LogRow({ log }: { log: LogEvent }) {
+  const { seq, time, level, logger, message, event, ...fields } = log;
+  const entries = Object.entries(fields);
+  const clock = new Date(time);
+  const format = (value: unknown) => {
+    const text = typeof value === "string" ? value : (JSON.stringify(value) ?? String(value));
+    return text.length > 120 ? `${text.slice(0, 120)}…` : text;
+  };
+  return (
+    <article className={`log-row level-${level.toLowerCase()}`}>
+      <div className="log-head">
+        <time>{Number.isNaN(clock.getTime()) ? time : clock.toLocaleTimeString("zh-CN", { hour12: false })}</time>
+        <span className="log-level">{level}</span>
+        <b>{event || message}</b>
+        <small>{logger}</small>
+        <span className="log-seq">#{seq}</span>
+      </div>
+      {entries.length > 0 && (
+        <div className="log-fields">
+          {entries.map(([key, value]) => (
+            <span key={key} className="log-field"><em>{key}</em>={format(value)}</span>
+          ))}
+        </div>
+      )}
+    </article>
+  );
+}
+
+function LogsView() {
+  const [logs, setLogs] = useState<LogEvent[]>([]);
+  const [paused, setPaused] = useState(false);
+  const [error, setError] = useState("");
+  const cursor = useRef(0);
+  const pausedRef = useRef(false);
+  const polling = useRef(false);
+  const firstPauseEffect = useRef(true);
+  const listRef = useRef<HTMLDivElement>(null);
+  const stickToBottom = useRef(true);
+
+  const poll = async () => {
+    if (pausedRef.current || polling.current) return;
+    polling.current = true;
+    try {
+      const events = await readResponse<LogEvent[]>(
+        await fetch(`${API}/logs?after=${cursor.current}&limit=200`));
+      if (events.length) {
+        cursor.current = events[events.length - 1].seq;
+        setLogs((current) => [...current, ...events].slice(-500));
+      }
+      setError("");
+    } catch (reason) {
+      setError(reasonOf(reason));
+    } finally {
+      polling.current = false;
+    }
+  };
+
+  useEffect(() => {
+    void poll();
+    const timer = window.setInterval(() => void poll(), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    pausedRef.current = paused;
+    if (firstPauseEffect.current) {
+      firstPauseEffect.current = false;
+      return;
+    }
+    if (!paused) void poll();
+  }, [paused]);
+
+  useLayoutEffect(() => {
+    const container = listRef.current;
+    if (!container || !stickToBottom.current) return;
+    container.scrollTop = container.scrollHeight;
+  }, [logs]);
+
+  const handleScroll = () => {
+    const container = listRef.current;
+    if (!container) return;
+    stickToBottom.current =
+      container.scrollHeight - container.scrollTop - container.clientHeight < 40;
+  };
+
+  return (
+    <section className="logs-view">
+      <div className="hero">
+        <div>
+          <span className="eyebrow">STRUCTURED RUNTIME LOG</span>
+          <h2>运行日志</h2>
+          <p>实时显示模型调用、Agent 工具步骤、论文导入等结构化事件；仅保留最近 1000 条。</p>
+        </div>
+        <div className="log-actions">
+          <span className={`log-status ${error ? "off" : paused ? "paused" : "on"}`}>
+            {error ? "连接中断" : paused ? "已暂停" : "实时监听中"}
+          </span>
+          <button className="secondary" onClick={() => setPaused((value) => !value)}>
+            {paused ? "继续" : "暂停"}
+          </button>
+          <button className="secondary" onClick={() => { setLogs([]); stickToBottom.current = true; }}>
+            清空视图
+          </button>
+        </div>
+      </div>
+      {error && <div className="notice"><span>{error}</span><button onClick={() => setError("")}>×</button></div>}
+      <div className="log-list" ref={listRef} onScroll={handleScroll}>
+        {logs.length ? logs.map((log) => <LogRow key={log.seq} log={log} />) : (
+          <div className="empty-state compact">
+            <h3>暂无日志</h3>
+            <p>发起一次对话或导入论文后，这里会实时出现结构化事件。</p>
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
 

@@ -128,6 +128,24 @@ class AgenticRagTestCase(unittest.TestCase):
         return agent.AgentRunner(config, self.db, self.vectors, chat_fn=fake_chat,
                                  enable_vectors=False)
 
+    def test_small_talk_detection(self) -> None:
+        for question in ("nihao", "你好！", "谢谢～", "hello", "ok"):
+            self.assertTrue(agent.is_small_talk(question), question)
+        for question in ("心力衰竭怎么治疗？", "你好，请解释这项研究的主要终点", "OR 值是什么"):
+            self.assertFalse(agent.is_small_talk(question), question)
+
+    def test_greeting_skips_retrieval_and_citation_verification(self) -> None:
+        finish = json.dumps({
+            "thought": "问候",
+            "tool": "finish",
+            "args": {"answer": "你好！请问有什么可以帮您？", "citations": []},
+        }, ensure_ascii=False)
+        result = self._runner([finish], mode="library").run("nihao")
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["citations"], [])
+        self.assertEqual(result["sources"], [])
+        self.assertEqual([step["tool"] for step in result["trace"]], ["finish"])
+
     def test_agent_searches_then_finishes_with_verified_quote(self) -> None:
         search = json.dumps({
             "thought": "先检索主要终点",

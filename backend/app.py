@@ -10,6 +10,7 @@ import re
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,7 +21,7 @@ from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from . import clinical, evidence, memory, ocr as ocr_module, ontology
+from . import clinical, evidence, memory, observability, ocr as ocr_module, ontology
 from .agent import AgentConfig, AgentError, AgentRunner
 from .credentials import (
     EXTRA_KEY_SOURCES, CredentialError, key_store as _credential_key_store, safe_key,
@@ -112,11 +113,17 @@ def _set_progress(paper_id: int, stage: str, current: int = 0, total: int = 0,
 
 
 def _progress_callback(paper_id: int):
+    last_stage = {"value": ""}
+
     def report(stage: str, current: int, total: int) -> None:
         try:
             _set_progress(paper_id, stage, current, total)
         except Exception:
             LOGGER.warning("failed to persist progress for paper %s", paper_id, exc_info=True)
+        if stage != last_stage["value"]:
+            last_stage["value"] = stage
+            observability.log_event("paper.progress", paper_id=paper_id, stage=stage,
+                                    current=current, total=total)
     return report
 
 
@@ -145,6 +152,8 @@ def _ocr_options() -> dict[str, Any]:
 
 
 def _run_import_job(paper_id: int, stored_path: str) -> None:
+    started = time.time()
+    observability.log_event("paper.import.start", paper_id=paper_id, path=stored_path)
     try:
         _set_progress(paper_id, "parsing", status="processing", error=None)
         document = fitz.open(stored_path)
@@ -162,9 +171,17 @@ def _run_import_job(paper_id: int, stored_path: str) -> None:
     except Exception as error:
         LOGGER.exception("import failed for paper %s", paper_id)
         _set_progress(paper_id, "failed", status="failed", error=str(error))
+        observability.log_event("paper.import.failed", level=logging.ERROR,
+                                paper_id=paper_id, error=str(error),
+                                elapsed_ms=int((time.time() - started) * 1000))
+    else:
+        observability.log_event("paper.import.done", paper_id=paper_id,
+                                elapsed_ms=int((time.time() - started) * 1000))
 
 
 def _run_reindex_job(paper_id: int, key: str) -> None:
+    started = time.time()
+    observability.log_event("paper.reindex.start", paper_id=paper_id)
     try:
         _set_progress(paper_id, "queued")
         reindex_document(paper_id, DB_PATH, VECTORS_DIR, key,
@@ -175,6 +192,12 @@ def _run_reindex_job(paper_id: int, key: str) -> None:
         # The extracted text and FTS index are still usable, so keep the paper
         # readable and surface the failure through progress/error_message.
         _set_progress(paper_id, "index_failed", error=str(error))
+        observability.log_event("paper.reindex.failed", level=logging.ERROR,
+                                paper_id=paper_id, error=str(error),
+                                elapsed_ms=int((time.time() - started) * 1000))
+    else:
+        observability.log_event("paper.reindex.done", paper_id=paper_id,
+                                elapsed_ms=int((time.time() - started) * 1000))
 
 
 def _enqueue_import(paper_id: int, stored_path: Path) -> None:
@@ -563,6 +586,12 @@ app.add_middleware(
 @app.on_event("startup")
 def startup() -> None:
     initialize_storage()
+    observability.setup_logging()
+    # Bind telemetry to this process's database only once the real server runs;
+    # importing the app (for tests) must never touch the live usage table.
+    providers.set_usage_recorder(
+        lambda usage: observability.record_usage(usage, DB_PATH))
+    observability.log_event("app.started", version=app.version, storage=str(APP_HOME))
 
 
 @app.on_event("shutdown")
@@ -581,6 +610,77 @@ def _frontend_built() -> bool:
 def health() -> dict[str, str]:
     return {"status": "ok", "storage": str(APP_HOME),
             "frontend": "built" if _frontend_built() else "source"}
+
+
+@app.get("/api/stats")
+def usage_stats() -> dict[str, Any]:
+    """Aggregate token, agent, tool and library usage for the stats page."""
+    day_start = datetime.now().astimezone().replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).astimezone(timezone.utc).isoformat()
+    with get_connection() as connection:
+        tokens = dict(connection.execute(
+            "SELECT COUNT(*) AS calls,"
+            " COALESCE(SUM(prompt_tokens),0) AS prompt,"
+            " COALESCE(SUM(completion_tokens),0) AS completion,"
+            " COALESCE(SUM(total_tokens),0) AS total,"
+            " COALESCE(SUM(estimated),0) AS estimated_calls,"
+            " COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END),0) AS today_calls,"
+            " COALESCE(SUM(CASE WHEN created_at >= ? THEN total_tokens ELSE 0 END),0)"
+            " AS today_total"
+            " FROM llm_usage",
+            (day_start, day_start),
+        ).fetchone())
+        runs = dict(connection.execute(
+            "SELECT COUNT(*) AS total,"
+            " COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END),0) AS today_runs,"
+            " COALESCE(SUM(verified),0) AS verified"
+            " FROM agent_runs",
+            (day_start,),
+        ).fetchone())
+        average = connection.execute(
+            "SELECT AVG(steps) FROM (SELECT COUNT(*) AS steps FROM agent_steps GROUP BY run_id)"
+        ).fetchone()
+        runs["avg_steps"] = round(float(average[0] or 0), 2)
+        maps = {
+            "modes": "SELECT mode, COUNT(*) AS count FROM agent_runs"
+                     " GROUP BY mode ORDER BY count DESC, mode",
+            "tools": "SELECT tool, COUNT(*) AS count FROM agent_steps"
+                     " GROUP BY tool ORDER BY count DESC, tool",
+            "models": "SELECT provider, model, COUNT(*) AS calls,"
+                      " COALESCE(SUM(total_tokens),0) AS total_tokens,"
+                      " COALESCE(SUM(estimated),0) AS estimated_calls"
+                      " FROM llm_usage GROUP BY provider, model"
+                      " ORDER BY total_tokens DESC, calls DESC LIMIT 12",
+        }
+        grouped = {name: [dict(row) for row in connection.execute(sql)]
+                   for name, sql in maps.items()}
+        sessions = dict(connection.execute(
+            "SELECT COUNT(*) AS total FROM general_sessions").fetchone())
+        sessions["messages"] = connection.execute(
+            "SELECT COUNT(*) FROM general_messages").fetchone()[0]
+        papers = dict(connection.execute(
+            "SELECT COUNT(*) AS total,"
+            " COALESCE(SUM(needs_ocr),0) AS needs_ocr,"
+            " COALESCE(SUM(vectorized),0) AS vectorized"
+            " FROM papers").fetchone())
+    return {
+        "tokens": tokens,
+        "runs": {**runs, "modes": grouped["modes"]},
+        "tools": {
+            "total": sum(item["count"] for item in grouped["tools"]),
+            "by_tool": grouped["tools"],
+        },
+        "models": grouped["models"],
+        "sessions": sessions,
+        "papers": papers,
+    }
+
+
+@app.get("/api/logs")
+def list_logs(after: int = 0, limit: int = 200) -> list[dict[str, Any]]:
+    """Structured events newer than ``after`` (bounded in-memory ring buffer)."""
+    return observability.recent(after, limit)
 
 
 @app.get("/api/papers")
@@ -768,26 +868,59 @@ def agent_chat(payload: AgentChatPayload):
                                      temperature=agent_config.temperature)
 
     runner = AgentRunner(agent_config, DB_PATH, VECTORS_DIR, stream_fn=stream_fn)
+    observability.log_event(
+        "agent.chat.start", mode=mode, provider=provider, model=model,
+        paper_id=paper_id, session_id=session_id, stream=payload.stream,
+        retry=payload.retry, question_chars=len(message),
+    )
 
     if not payload.stream:
+        started = time.time()
         try:
             done = runner.run(message)
         except AgentError as error:
+            observability.log_event("agent.chat.error", level=logging.WARNING,
+                                    mode=mode, error=str(error))
             raise HTTPException(502, str(error)) from error
         if not payload.retry:
             _store_agent_message(mode, paper_id, "user", message, provider, session_id)
         _store_agent_message(mode, paper_id, "assistant", done.get("content", ""),
                              provider, session_id)
+        observability.log_event(
+            "agent.chat.done", mode=mode, run_id=done.get("id"),
+            verified=bool(done.get("verified")), steps=len(done.get("trace") or []),
+            warnings=len(done.get("warnings") or []),
+            elapsed_ms=int((time.time() - started) * 1000),
+        )
         return done
 
     if not payload.retry:
         _store_agent_message(mode, paper_id, "user", message, provider, session_id)
 
     def generate():
+        started = time.time()
         for event in runner.run_iter(message):
-            if event.get("type") == "done":
+            kind = event.get("type")
+            if kind == "step":
+                observation = event.get("observation") or {}
+                observability.log_event(
+                    "agent.step", step=event.get("index"), tool=event.get("tool"),
+                    ok=bool(observation.get("ok")) if isinstance(observation, dict) else False,
+                    duration_ms=event.get("duration_ms"),
+                )
+            elif kind == "done":
                 _store_agent_message(mode, paper_id, "assistant", event.get("content", ""),
                                      provider, session_id)
+                observability.log_event(
+                    "agent.chat.done", mode=mode, run_id=event.get("id"),
+                    verified=bool(event.get("verified")),
+                    steps=len(event.get("trace") or []),
+                    warnings=len(event.get("warnings") or []),
+                    elapsed_ms=int((time.time() - started) * 1000),
+                )
+            elif kind == "error":
+                observability.log_event("agent.chat.error", level=logging.WARNING,
+                                        mode=mode, error=str(event.get("error") or ""))
             yield json.dumps(event, ensure_ascii=False) + "\n"
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")

@@ -104,3 +104,44 @@ body{overflow:hidden}
 .session-bar button:disabled{opacity:.55;cursor:not-allowed}
 .session-bar small{flex-basis:100%;color:#789088;font-size:11px}
 @media(max-width:640px){.session-bar label{min-width:100%}.session-bar button{width:100%}}
+
+/* --- Usage dashboard & structured logs ----------------------------------- */
+.stats-view,.logs-view{max-width:1300px;margin:auto}
+.secondary{border:1px solid #bcd6c8;background:#fff;color:#176b57;border-radius:7px;padding:9px 14px;font-weight:700}
+.secondary:hover:not(:disabled){border-color:#72ab93}
+.secondary:disabled{opacity:.6;cursor:not-allowed}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin:20px 0}
+.stat-card{background:#fff;border:1px solid #e0e8e4;border-radius:9px;padding:16px}
+.stat-card strong{display:block;font-size:26px;color:#176b57;margin:8px 0 4px;font-variant-numeric:tabular-nums}
+.stat-card small{color:#789088;font-size:11px;line-height:1.5}
+.stat-columns{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.stat-panel{background:#fff;border:1px solid #e0e8e4;border-radius:9px;padding:18px;margin-bottom:14px;min-width:0}
+.stat-panel table{width:100%;border-collapse:collapse;font-size:12px}
+.stat-panel th,.stat-panel td{border-top:1px solid #e8efeb;padding:8px 6px;text-align:left;vertical-align:top}
+.stat-panel th{color:#789088;font-size:11px;font-weight:700;border-top:0}
+.stat-panel td:last-child,.stat-panel th:last-child{text-align:right;font-variant-numeric:tabular-nums}
+.stat-panel .muted,.muted{color:#789088;font-size:12px}
+.stat-chips{display:flex;gap:8px;flex-wrap:wrap}
+.stat-chip{border:1px solid #d5e5db;background:#f0f6f2;color:#456359;border-radius:99px;padding:6px 12px;font-size:12px}
+.stat-chip b{margin-left:8px;color:#176b57}
+.log-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.log-status{font-size:12px;font-weight:700;border-radius:99px;padding:5px 10px}
+.log-status.on{background:#e6f4ed;color:#176b57}
+.log-status.paused{background:#fff8e8;color:#7d663b}
+.log-status.off{background:#fdecec;color:#a34040}
+.log-list{background:#fff;border:1px solid #e0e8e4;border-radius:9px;height:calc(100vh - 240px);min-height:320px;overflow:auto;padding:10px;font-size:12px}
+.log-row{border-bottom:1px solid #eef3f0;padding:8px 6px}
+.log-row:last-child{border-bottom:0}
+.log-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.log-head time{color:#789088;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
+.log-head b{color:#172b27;font-weight:700}
+.log-head small{color:#789088;font-size:11px}
+.log-seq{margin-left:auto;color:#a3b3ac;font-size:10px}
+.log-level{font-size:10px;font-weight:800;border-radius:4px;padding:1px 5px;background:#edf3f0;color:#557168}
+.level-warning .log-level{background:#fff3d6;color:#8a6a1f}
+.level-error .log-level{background:#fdecec;color:#a34040}
+.level-debug .log-level{background:#eef1f4;color:#6e7f8c}
+.log-fields{display:flex;gap:6px;flex-wrap:wrap;margin-top:5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:#456359}
+.log-field{background:#f4f8f6;border:1px solid #e4ede8;border-radius:4px;padding:2px 6px;max-width:100%;overflow-wrap:anywhere}
+.log-field em{font-style:normal;color:#176b57;margin-right:2px}
+@media(max-width:900px){.stat-columns{grid-template-columns:1fr}.log-list{height:60vh}}

@@ -36,6 +36,20 @@ MAX_OBSERVATION_CHARS = 9000
 ANSWER_TOOL_RE = re.compile(r'"tool"\s*:\s*"finish"')
 ANSWER_FIELD_RE = re.compile(r'"answer"\s*:\s*"')
 
+# Pure greetings need no paper retrieval; running it anyway fills the evidence
+# panel with unrelated PDF snippets and an empty "citation verified" badge.
+SMALL_TALK_RE = re.compile(
+    r"^(?:你好|您好|嗨|哈喽|在吗|早安|早上好|晚上好|谢谢|多谢|感谢|再见|"
+    r"你是谁|你会什么|介绍一下你自己|"
+    r"nihao|ni\s*hao|hello|hi|hey|thanks?|thank\s+you|thx|ok(?:ay)?|"
+    r"好的|好|收到|明白(?:了)?|bye)[呀啊呢哦啦!！。.，,?？~～\s]*$",
+    re.IGNORECASE,
+)
+
+
+def is_small_talk(question: str) -> bool:
+    return bool(SMALL_TALK_RE.match((question or "").strip()))
+
 
 class AgentError(RuntimeError):
     """Raised when an agent run cannot produce any usable result."""
@@ -771,7 +785,10 @@ class AgentRunner:
                     require_citation=require_citation, nli_judge=judge,
                 )
         warnings = list(validation.warnings)
-        verified = validation.ok and (validation.level != "none" or not require_citation)
+        # "Verified" describes citations, not the answer: without citations
+        # there is nothing to verify (e.g. a greeting or a general-knowledge
+        # reply), so the UI must not show a green check.
+        verified = validation.ok and bool(validation.citations)
         if require_citation and not any(item.verified for item in validation.citations):
             fallback_answer, fallback_citations = self._fallback("引用无法核对")
             if fallback_answer:
@@ -794,7 +811,7 @@ class AgentRunner:
                     answer, fallback_citations, self.evidence,
                     default_paper_id=self.config.paper_id, require_citation=require_citation,
                 )
-                verified = any(item.verified for item in validation.citations) or not require_citation
+                verified = any(item.verified for item in validation.citations)
             else:
                 raise AgentError("模型没有返回可用回答")
         if verified and validation.citations and not PAGE_RE.search(answer):
@@ -893,8 +910,9 @@ class AgentRunner:
             if self._paper_row(self.config.paper_id) is None:
                 yield {"type": "error", "error": "论文不存在"}
                 return
-        initial_rows = self._initial_rows(question)
-        memories = self._recall_memories(question)
+        conversational = is_small_talk(question)
+        initial_rows = [] if conversational else self._initial_rows(question)
+        memories = [] if conversational else self._recall_memories(question)
         messages: list[dict[str, str]] = [
             {"role": "system", "content": _system_prompt(self.config)},
             {"role": "user", "content": _initial_user_prompt(
@@ -923,12 +941,13 @@ class AgentRunner:
                         default_paper_id=self.config.paper_id, require_citation=False,
                     )
                     answer, _ = apply_safety(fallback_answer, question)
-                    run_id = self._persist(question, answer, validation.as_dicts(), True,
+                    verified = validation.ok and bool(validation.citations)
+                    run_id = self._persist(question, answer, validation.as_dicts(), verified,
                                            validation.level, [str(error)])
                     yield {"type": "done", "id": run_id, "content": answer,
                            "citations": validation.as_dicts(),
                            "sources": retrieval.to_sources(self.evidence[:12]),
-                           "trace": self.trace, "verified": True,
+                           "trace": self.trace, "verified": verified,
                            "citation_level": validation.level,
                            "warnings": [f"模型服务异常，已回退到检索原文：{error}"],
                            "safety": {"emergency": assessment.emergency, "matched": assessment.matched}}

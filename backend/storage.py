@@ -126,6 +126,17 @@ CREATE TABLE IF NOT EXISTS general_messages (
     provider TEXT,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated INTEGER NOT NULL DEFAULT 0,
+    kind TEXT NOT NULL DEFAULT 'chat',
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS general_session_summaries (
     session_id INTEGER PRIMARY KEY,
     summary TEXT NOT NULL,

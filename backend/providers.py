@@ -21,7 +21,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional, Union
+from typing import Any, Callable, Iterator, Optional, Union
+
+from . import token_budget
 
 MAX_TOKENS = 4096
 ANTHROPIC_VERSION = "2023-06-01"
@@ -51,6 +53,69 @@ PROTOCOL_DEFAULTS = {
         "auth": "x-goog-api-key",
     },
 }
+
+
+# Configured by the API layer; lets this low-level module stay storage-agnostic.
+_usage_recorder: Optional[Callable[[dict[str, Any]], None]] = None
+
+
+def set_usage_recorder(recorder: Optional[Callable[[dict[str, Any]], None]]) -> None:
+    global _usage_recorder
+    _usage_recorder = recorder
+
+
+def _emit_usage(config: ProviderConfig, model: str, messages: list[dict[str, str]],
+                content: str, usage: Optional[dict[str, Any]] = None,
+                kind: str = "chat") -> None:
+    recorder = _usage_recorder
+    if recorder is None:
+        return
+    prompt = completion = None
+    if isinstance(usage, dict) and usage:
+        prompt = _usage_int(usage.get("prompt_tokens"))
+        completion = _usage_int(usage.get("completion_tokens"))
+    estimated = prompt is None or completion is None
+    if estimated:
+        prompt = token_budget.estimate_messages(messages)
+        completion = token_budget.estimate_tokens(content)
+    payload = {
+        "provider": config.id,
+        "model": model,
+        "prompt_tokens": int(prompt or 0),
+        "completion_tokens": int(completion or 0),
+        "total_tokens": int((prompt or 0) + (completion or 0)),
+        "estimated": estimated,
+        "kind": kind,
+    }
+    try:
+        recorder(payload)
+    except Exception:  # pragma: no cover - telemetry is best-effort
+        pass
+
+
+def _usage_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _usage_from_response(config: ProviderConfig,
+                         data: dict[str, Any]) -> dict[str, Any]:
+    if config.protocol == "anthropic":
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        return {"prompt_tokens": usage.get("input_tokens"),
+                "completion_tokens": usage.get("output_tokens")}
+    if config.protocol == "gemini":
+        usage = data.get("usageMetadata") if isinstance(data.get("usageMetadata"), dict) else {}
+        return {"prompt_tokens": usage.get("promptTokenCount"),
+                "completion_tokens": usage.get("candidatesTokenCount")}
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    return {"prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens")}
 
 
 @dataclass(frozen=True)
@@ -437,11 +502,13 @@ def chat(provider: Union[str, ProviderConfig], key: str, model: str,
          timeout: float = 60.0, max_tokens: int = MAX_TOKENS) -> str:
     """Return a complete assistant message for any supported protocol."""
     config = resolve_config(provider)
-    request = _request(config, key, model, _normalise_messages(messages),
-                       temperature, False, max_tokens)
+    normalised = _normalise_messages(messages)
+    request = _request(config, key, model, normalised, temperature, False, max_tokens)
     with _open(request, timeout, key) as response:
         raw = response.read()
-    content = _read_text(config, _json_response(raw))
+    data = _json_response(raw)
+    content = _read_text(config, data)
+    _emit_usage(config, model, normalised, content, _usage_from_response(config, data))
     if not content.strip():
         raise ProviderError("模型返回了空响应")
     return content
@@ -471,34 +538,55 @@ def stream(provider: Union[str, ProviderConfig], key: str, model: str,
            timeout: float = 120.0, max_tokens: int = MAX_TOKENS) -> Iterator[str]:
     """Yield text deltas from an OpenAI, Anthropic or Gemini SSE response."""
     config = resolve_config(provider)
-    request = _request(config, key, model, _normalise_messages(messages),
-                       temperature, True, max_tokens)
-    with _open(request, timeout, key) as response:
-        for chunk in _iter_sse(response):
-            if config.protocol == "openai":
-                choices = chunk.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta") or {}
-                piece = delta.get("content")
-                if isinstance(piece, list):
-                    piece = "".join(
-                        part.get("text", "") for part in piece
-                        if isinstance(part, dict) and isinstance(part.get("text"), str)
-                    )
-            elif config.protocol == "anthropic":
-                if chunk.get("type") == "error":
-                    error = chunk.get("error") or {}
-                    message = error.get("message") if isinstance(error, dict) else None
-                    raise ProviderError(str(message or "模型流式响应出错")[:300])
-                if chunk.get("type") != "content_block_delta":
-                    continue
-                delta = chunk.get("delta") or {}
-                piece = delta.get("text") if delta.get("type", "text_delta") == "text_delta" else None
-            else:
-                piece = _text_from_gemini(chunk)
-            if isinstance(piece, str) and piece:
-                yield piece
+    normalised = _normalise_messages(messages)
+    request = _request(config, key, model, normalised, temperature, True, max_tokens)
+    pieces: list[str] = []
+    usage: dict[str, Any] = {}
+    try:
+        with _open(request, timeout, key) as response:
+            for chunk in _iter_sse(response):
+                if config.protocol == "openai":
+                    if isinstance(chunk.get("usage"), dict):
+                        usage.update(_usage_from_response(config, chunk))
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    piece = delta.get("content")
+                    if isinstance(piece, list):
+                        piece = "".join(
+                            part.get("text", "") for part in piece
+                            if isinstance(part, dict) and isinstance(part.get("text"), str)
+                        )
+                elif config.protocol == "anthropic":
+                    if chunk.get("type") == "error":
+                        error = chunk.get("error") or {}
+                        message = error.get("message") if isinstance(error, dict) else None
+                        raise ProviderError(str(message or "模型流式响应出错")[:300])
+                    if chunk.get("type") == "message_start":
+                        message = chunk.get("message") or {}
+                        chunk_usage = message.get("usage") or {}
+                        usage.update({"prompt_tokens": chunk_usage.get("input_tokens"),
+                                      "completion_tokens": chunk_usage.get("output_tokens")})
+                        continue
+                    if chunk.get("type") == "message_delta":
+                        chunk_usage = chunk.get("usage") or {}
+                        usage.update({"completion_tokens": chunk_usage.get("output_tokens")})
+                        continue
+                    if chunk.get("type") != "content_block_delta":
+                        continue
+                    delta = chunk.get("delta") or {}
+                    piece = delta.get("text") if delta.get("type", "text_delta") == "text_delta" else None
+                else:
+                    if isinstance(chunk.get("usageMetadata"), dict):
+                        usage.update(_usage_from_response(config, chunk))
+                    piece = _text_from_gemini(chunk)
+                if isinstance(piece, str) and piece:
+                    pieces.append(piece)
+                    yield piece
+    finally:
+        if pieces or usage.get("prompt_tokens") is not None:
+            _emit_usage(config, model, normalised, "".join(pieces), usage, kind="stream")
 
 
 def extract_json_object(text: str) -> Optional[dict[str, Any]]:

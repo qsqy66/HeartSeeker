@@ -185,7 +185,7 @@ npm run dev
 
 ## 数据与隐私
 
-- 默认数据目录：用户目录下的 `HeartSeeker_Med`（Windows 为 `%USERPROFILE%\HeartSeeker_Med`），可用 `HEARTSEEKER_MED_HOME` 覆盖。已有安装若存在旧目录 `PaperReader`，会自动继续使用旧目录，数据无需手动迁移；旧版 `PAPER_READER_*` 环境变量与旧凭据库命名空间仍兼容。
+- 默认数据目录：用户目录下的 `HeartSeeker`（Windows 为 `%USERPROFILE%\HeartSeeker`），可用 `HEARTSEEKER_MED_HOME` 覆盖。
 - 目录内容：`papers/`（原始 PDF）、`database/`（SQLite）、`vectors/`（LanceDB）、`cache/`、`logs/`、`exports/`。
 - 远端调用边界：读取模型列表、结构化精读、Agent 问答会访问所选问答供应商；嵌入计算访问 DashScope；启用 Qwen 远程重排时会向配置的重排地址发送查询和候选片段。只发送问题、必要原文片段、嵌入文本和重排候选。问答、嵌入、重排 Key 分别保存在系统凭据库。
 - Agent 运行轨迹、引用、反馈和用户笔记保存在本地 SQLite（`agent_runs`、`agent_steps`、`feedback`、`agent_memories`）。
@@ -271,8 +271,8 @@ python scripts/evaluate.py --json
 
 ```bash
 python scripts/evaluate.py \
-  --db ~/HeartSeeker_Med/database/heartseeker_med.sqlite3 \
-  --vectors ~/HeartSeeker_Med/vectors \
+  --db ~/HeartSeeker/database/heartseeker.sqlite3 \
+  --vectors ~/HeartSeeker/vectors \
   --dataset eval/live_cases.json --no-vectors
 ```
 

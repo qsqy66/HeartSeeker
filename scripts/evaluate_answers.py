@@ -9,7 +9,7 @@ Two modes:
 
 * live run against a local library (needs a configured chat model)::
 
-      python scripts/evaluate_answers.py --db ~/HeartSeeker_Med/database/heartseeker_med.sqlite3 \\
+      python scripts/evaluate_answers.py --db ~/HeartSeeker/database/heartseeker.sqlite3 \\
           --provider ollama --model qwen2.5:7b
 
 Use ``--offline`` with live mode to build a temporary library from

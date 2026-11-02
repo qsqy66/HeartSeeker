@@ -9,8 +9,6 @@ from .providers import PROVIDERS
 # out of PROVIDERS means they never appear in the chat-provider picker.
 EXTRA_KEY_SOURCES = {"qwen-rerank", "qwen-nli", "aliyun-ocr"}
 SERVICE_NAME = "heartseeker-med"
-# Keys saved before the rename stay readable; new writes use the new service.
-LEGACY_SERVICE_NAME = "paper-reader"
 
 
 class CredentialError(RuntimeError):
@@ -34,8 +32,7 @@ def key_store(provider: str, value: Optional[str] = None) -> Optional[str]:
     try:
         import keyring  # type: ignore
         if value is None:
-            return (keyring.get_password(SERVICE_NAME, provider)
-                    or keyring.get_password(LEGACY_SERVICE_NAME, provider))
+            return keyring.get_password(SERVICE_NAME, provider)
         keyring.set_password(SERVICE_NAME, provider, value)
         return value
     except Exception as error:  # keyring has platform-specific exception types

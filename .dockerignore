@@ -4,6 +4,6 @@ node_modules
 dist
 __pycache__
 *.pyc
-PaperReader
+HeartSeeker
 HeartSeeker_Med
 data

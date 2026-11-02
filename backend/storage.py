@@ -9,26 +9,17 @@ from typing import Optional
 
 from . import tokenization
 
-LEGACY_APP_HOME = Path.home() / "PaperReader"
-NEW_APP_HOME = Path.home() / "HeartSeeker_Med"
+DEFAULT_APP_HOME = Path.home() / "HeartSeeker"
 
 
 def _default_app_home() -> Path:
-    """Prefer the new data directory, but keep existing installations intact."""
-    for variable in ("HEARTSEEKER_MED_HOME", "PAPER_READER_HOME"):
-        override = os.environ.get(variable)
-        if override:
-            return Path(override)
-    if LEGACY_APP_HOME.is_dir() and not NEW_APP_HOME.is_dir():
-        return LEGACY_APP_HOME
-    return NEW_APP_HOME
+    override = os.environ.get("HEARTSEEKER_MED_HOME")
+    return Path(override) if override else DEFAULT_APP_HOME
 
 
 APP_HOME = _default_app_home()
 PAPERS_DIR = APP_HOME / "papers"
-_LEGACY_DB_PATH = APP_HOME / "database" / "paper_reader.sqlite3"
-DB_PATH = (_LEGACY_DB_PATH if _LEGACY_DB_PATH.exists()
-           else APP_HOME / "database" / "heartseeker_med.sqlite3")
+DB_PATH = APP_HOME / "database" / "heartseeker.sqlite3"
 VECTORS_DIR = APP_HOME / "vectors"
 
 SCHEMA = """

@@ -10,7 +10,7 @@ Examples:
     python scripts/benchmark_models.py --offline \\
         --models qwen2.5:7b,llama3.1:8b
 
-    python scripts/benchmark_models.py --db ~/HeartSeeker_Med/database/heartseeker_med.sqlite3 \\
+    python scripts/benchmark_models.py --db ~/HeartSeeker/database/heartseeker.sqlite3 \\
         --provider ollama --base-url http://127.0.0.1:11434/v1 \\
         --models qwen2.5:14b --output benchmarks/qwen.json
 """

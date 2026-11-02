@@ -24,10 +24,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
-BACKEND_PORT = int(os.environ.get("HEARTSEEKER_MED_PORT")
-                   or os.environ.get("PAPER_READER_PORT", "8765"))
-FRONTEND_PORT = int(os.environ.get("HEARTSEEKER_MED_FRONTEND_PORT")
-                    or os.environ.get("PAPER_READER_FRONTEND_PORT", "5173"))
+BACKEND_PORT = int(os.environ.get("HEARTSEEKER_MED_PORT", "8765"))
+FRONTEND_PORT = int(os.environ.get("HEARTSEEKER_MED_FRONTEND_PORT", "5173"))
 BACKEND_URL = f"http://127.0.0.1:{BACKEND_PORT}"
 FRONTEND_URL = f"http://127.0.0.1:{FRONTEND_PORT}"
 

@@ -6,8 +6,7 @@ deterministic local aid for query expansion and concept lookup, not a clinical
 knowledge base.
 
 A deployment can replace the subset with its own JSON file by setting
-``HEARTSEEKER_MED_ONTOLOGY=/path/to/ontology.json`` (legacy
-``PAPER_READER_ONTOLOGY`` also works) or calling
+``HEARTSEEKER_MED_ONTOLOGY=/path/to/ontology.json`` or calling
 :func:`reload_ontology`.
 """
 from __future__ import annotations
@@ -21,7 +20,6 @@ from typing import Any, Iterable, Optional
 
 DEFAULT_PATH = Path(__file__).resolve().parent / "data" / "medical_ontology.json"
 ENV_PATH = "HEARTSEEKER_MED_ONTOLOGY"
-LEGACY_ENV_PATH = "PAPER_READER_ONTOLOGY"
 CJK_RE = re.compile(r"[㐀-鿿]")
 ASCII_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
 
@@ -159,7 +157,7 @@ class Ontology:
 
 def load_ontology(path: Optional[Path | str] = None) -> Ontology:
     source = Path(path) if path else Path(
-        os.environ.get(ENV_PATH) or os.environ.get(LEGACY_ENV_PATH) or DEFAULT_PATH)
+        os.environ.get(ENV_PATH) or DEFAULT_PATH)
     if not source.is_file():
         raise OntologyError(f"找不到本地医学本体文件：{source}")
     try:

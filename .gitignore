@@ -4,10 +4,8 @@ dist/
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.paper-reader-*/
 .heartseeker-med-*/
-PaperReader/
-HeartSeeker_Med/
+HeartSeeker/
 .env
 .env.*
 *.sqlite3

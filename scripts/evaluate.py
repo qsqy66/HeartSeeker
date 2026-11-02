@@ -8,8 +8,8 @@ library and can opt into vector search with --vectors.
 Examples:
     python scripts/evaluate.py
     python scripts/evaluate.py --json
-    python scripts/evaluate.py --db ~/HeartSeeker_Med/database/heartseeker_med.sqlite3 \
-        --vectors ~/HeartSeeker_Med/vectors --dataset eval/live_cases.json
+    python scripts/evaluate.py --db ~/HeartSeeker/database/heartseeker.sqlite3 \
+        --vectors ~/HeartSeeker/vectors --dataset eval/live_cases.json
 """
 from __future__ import annotations
 

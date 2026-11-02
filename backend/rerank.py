@@ -147,7 +147,6 @@ class QwenReranker:
         self.base_url = (
             (base_url or "").strip()
             or os.environ.get("HEARTSEEKER_MED_RERANK_URL", "").strip()
-            or os.environ.get("PAPER_READER_RERANK_URL", "").strip()
             or DEFAULT_QWEN_RERANK_URL
         )
         self.api_key = (api_key or "").strip()

@@ -2247,6 +2247,14 @@ function SettingsView({
           </small>
         </label>
         <h3 className="settings-section">本地处理管线</h3>
+        <div className="security-note">
+          <b>OCR 什么时候会被调用：</b>只在导入 PDF（或对失败论文点“重试”）时逐页判断，
+          检索、问答、重建索引都不会触发。一页同时满足三个条件才会识别：
+          ① 已启用 OCR；② 所选引擎可用；③ 该页文本层少于 20 个字符。
+          所以扫描件、纯图片页、几乎没有文字层的页面会走 OCR，
+          正常带文字层的页面（≥20 字符）不会。单页识别失败不阻断导入；
+          整篇没有任何文本时，论文会标记为“需 OCR”。
+        </div>
         <label>
           扫描件 OCR
           <select
@@ -2273,6 +2281,7 @@ function SettingsView({
             <option value="none">不启用</option>
           </select>
           <small className="field-help">
+            自动模式按 RapidOCR → Tesseract 顺序选择，两者都不可用时视为无引擎。
             阿里云 OCR 会把扫描页图像上传到阿里云，按调用量计费；本地方案不产生网络请求。
           </small>
         </label>

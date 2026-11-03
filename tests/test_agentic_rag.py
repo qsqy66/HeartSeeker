@@ -262,6 +262,50 @@ class AgenticRagTestCase(unittest.TestCase):
         self.assertFalse(missing.ok)
         self.assertEqual(missing.missing_pages, [9])
 
+    def test_noncontiguous_quote_verified_sentence_by_sentence(self) -> None:
+        page_text = (
+            "Premature termination codons in early M-band exons (e.g., in exon 359) "
+            "result in the loss of most titin M- band domains and, thereby, in severe "
+            "congenital myopathies with a neonatal hypotonia and respiratory distress "
+            "leading to a life-threatening risk for the affected baby. "
+            "Moreover, parents may have experienced previous miscarriages. "
+            "Premature termination codons in the last two exons result in near–full "
+            "length protein, only lacking the most terminal part of the protein, and, "
+            "consequently, in a milder phenotype with a later onset."
+        )
+        evidence = [{"paper_id": 1, "page_number": 1, "text": page_text}]
+        quote = (
+            "Premature termination codons in early M-band exons (e.g., in exon 359) "
+            "result in the loss of most titin M-band domains and, thereby, in severe "
+            "congenital myopathies with a neonatal hypotonia and respiratory distress "
+            "leading to a life-threatening risk for the affected baby. "
+            "Premature termination codons in the last two exons result in near–full "
+            "length protein, only lacking the most terminal part of the protein, and, "
+            "consequently, in a milder phenotype with a later onset."
+        )
+        result = citations.validate_citations(
+            "结论 [Page 1]",
+            [{"paper_id": 1, "page": 1, "quote": quote, "claim": "变异位置决定严重程度"}],
+            evidence, default_paper_id=1, require_citation=True,
+        )
+        self.assertTrue(result.ok)
+        self.assertTrue(result.citations[0].verified)
+        self.assertEqual(result.citations[0].level, "quote")
+
+    def test_fabricated_sentence_in_quote_is_rejected(self) -> None:
+        evidence = [{"paper_id": 1, "page_number": 1,
+                     "text": "The primary outcome was all-cause mortality at 12 months."}]
+        quote = ("The primary outcome was all-cause mortality at 12 months. "
+                 "This fabricated sentence is definitely not in the paper.")
+        result = citations.validate_citations(
+            "结论 [Page 1]",
+            [{"paper_id": 1, "page": 1, "quote": quote}],
+            evidence, default_paper_id=1, require_citation=True,
+        )
+        self.assertFalse(result.ok)
+        self.assertFalse(result.citations[0].verified)
+        self.assertTrue(result.invalid)
+
     def test_emergency_safety_preface(self) -> None:
         answer, assessment = safety.apply_safety("可能是心梗。", "胸痛伴呼吸困难怎么办？")
         self.assertTrue(assessment.emergency)

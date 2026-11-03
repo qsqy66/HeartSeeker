@@ -16,6 +16,11 @@ from . import verification
 
 PAGE_RE = re.compile(r"\[Page\s+(\d+)\]", re.IGNORECASE)
 SPACE_RE = re.compile(r"\s+")
+# Split after Chinese sentence punctuation, or after Latin punctuation followed
+# by whitespace.  The whitespace rule keeps decimals (0.05) and abbreviations
+# such as "e.g.," from creating spurious fragments.
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？])|(?<=[.!?])\s+")
+MIN_FRAGMENT_CHARS = 6
 
 
 def normalize_quote(text: str) -> str:
@@ -24,6 +29,33 @@ def normalize_quote(text: str) -> str:
     text = re.sub(r"-\s*\n\s*", "", text)  # join hyphenated line breaks
     text = SPACE_RE.sub("", text)
     return re.sub(r"[^\w㐀-鿿]+", "", text)
+
+
+def _quote_fragments(quote: str) -> list[str]:
+    """Normalize a quote sentence by sentence for non-contiguous matching.
+
+    Models sometimes join two passages from the same page while omitting an
+    intervening sentence.  Such a quote is not a contiguous substring, but each
+    sentence may still be verbatim evidence.  Short fragments are dropped so
+    abbreviations and decimal points cannot produce trivial matches.
+    """
+    fragments: list[str] = []
+    for part in SENTENCE_SPLIT_RE.split(quote or ""):
+        normalized = normalize_quote(part)
+        if len(normalized) >= MIN_FRAGMENT_CHARS:
+            fragments.append(normalized)
+    return fragments
+
+
+def _quote_supported(quote: str, page_text: str, paper_text: str) -> bool:
+    """Return True when the quote is contiguous evidence or all its sentences are."""
+    page_normalized = normalize_quote(page_text)
+    if normalize_quote(quote) in page_normalized:
+        return True
+    if normalize_quote(quote) in normalize_quote(paper_text):
+        return True
+    fragments = _quote_fragments(quote)
+    return bool(fragments) and all(fragment in page_normalized for fragment in fragments)
 
 
 def extract_pages(text: str) -> list[int]:
@@ -146,21 +178,19 @@ def validate_citations(answer: str, raw_citations: Optional[list[dict[str, Any]]
 
         if quote and len(normalize_quote(quote)) >= 6:
             page_text = "\n".join(index.get((paper_id, page), []))
-            if normalize_quote(quote) in normalize_quote(page_text):
+            # Quotes occasionally span adjacent chunks from the same page, or
+            # join several same-page sentences while omitting an intervening
+            # one.  Both still verify at quote level rather than page level.
+            paper_text = "\n".join(
+                text for (row_paper, _), texts in index.items()
+                if row_paper in (paper_id, None) for text in texts
+            )
+            if _quote_supported(quote, page_text, paper_text):
                 citation.verified = True
                 citation.level = "quote"
             else:
-                # Quotes occasionally span two adjacent chunks from the same page.
-                paper_text = "\n".join(
-                    text for (row_paper, _), texts in index.items()
-                    if row_paper in (paper_id, None) for text in texts
-                )
-                if normalize_quote(quote) in normalize_quote(paper_text):
-                    citation.verified = True
-                    citation.level = "quote"
-                else:
-                    invalid.append({"page": page, "paper_id": paper_id,
-                                    "reason": "引文未在证据原文中找到", "quote": quote})
+                invalid.append({"page": page, "paper_id": paper_id,
+                                "reason": "引文未在证据原文中找到", "quote": quote})
         else:
             citation.verified = True
             citation.level = "page"

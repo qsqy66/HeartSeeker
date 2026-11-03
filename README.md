@@ -144,27 +144,31 @@
 python3 start.py        # Windows: start.bat / python start.py
 ```
 
-首次运行会创建 `.venv`、安装后端依赖和前端依赖；之后复用。默认启动后端 `127.0.0.1:8765` 与前端 `127.0.0.1:5173` 并打开浏览器。`Ctrl+C` 一次停止两个服务。
+默认单进程启动：后端 `127.0.0.1:8765` 同时托管已构建的前端并打开浏览器，`Ctrl+C` 停止服务。首次运行会创建 `.venv`、安装后端依赖和前端依赖；若尚未构建前端，会自动回退到 Vite 开发模式（`127.0.0.1:5173`，需要 Node.js）。
 
-可选参数：`--no-browser`；环境变量 `HEARTSEEKER_MED_PORT` / `HEARTSEEKER_MED_FRONTEND_PORT` 可覆盖端口。
+可选参数：
 
-### 手动启动
+- `--build`：先构建前端，再以单进程模式启动
+- `--dev`：强制 Vite 开发模式
+- `--prod`：只启动后端，要求已有 `dist/`
+- `--no-browser`：不自动打开浏览器
+
+环境变量 `HEARTSEEKER_MED_PORT` / `HEARTSEEKER_MED_FRONTEND_PORT` 可覆盖端口。
+
+### 手动启动（生产模式）
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r backend/requirements.txt
+npm install
+npm run build
 python -m uvicorn backend.app:app --host 127.0.0.1 --port 8765
 ```
 
-另开终端：
+访问 <http://127.0.0.1:8765>。后端只监听 `127.0.0.1`，并同时托管 `dist/`。
 
-```bash
-npm install
-npm run dev
-```
-
-访问 <http://localhost:5173>。后端只监听 `127.0.0.1`。
+前端开发时可另开终端运行 `npm run dev`，访问 <http://localhost:5173>。
 
 ## 使用流程
 

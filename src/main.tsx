@@ -17,6 +17,9 @@ import "./styles.css";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
 
+// Keep each multipart request small; the backend accepts up to 50 PDFs.
+const IMPORT_BATCH_SIZE = 20;
+
 type Paper = {
   id: number;
   title: string;
@@ -34,6 +37,20 @@ type Paper = {
   progress_total?: number;
 };
 type PaperStatus = Paper & { progress_ratio?: number };
+type BatchImportResult = {
+  file_name: string;
+  status: "queued" | "duplicate" | "failed";
+  id?: number;
+  title?: string;
+  page_count?: number;
+  error?: string;
+};
+type BatchImportResponse = {
+  results: BatchImportResult[];
+  imported: number;
+  duplicates: number;
+  failed: number;
+};
 type Page = { id: number; page_number: number; text: string };
 type PaperDetails = { paper: Paper; pages: Page[] };
 type SearchResult = {
@@ -752,24 +769,47 @@ function App() {
     return null;
   };
 
-  const importFile = async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
+  const importFiles = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    if (!files.length) return;
     setImporting(true);
-    const body = new FormData();
-    body.append("file", file);
+    const accepted: { id: number; title: string }[] = [];
+    const failures: string[] = [];
+    let duplicates = 0;
     try {
-      const payload = await readResponse<{ id: number; title: string }>(
-        await fetch(`${API}/papers/import`, { method: "POST", body }),
-      );
-      setNotice(`“${payload.title}”已上传，正在本机解析…`);
+      for (let start = 0; start < files.length; start += IMPORT_BATCH_SIZE) {
+        const slice = files.slice(start, start + IMPORT_BATCH_SIZE);
+        const done = Math.min(start + slice.length, files.length);
+        setNotice(`正在上传 ${done}/${files.length} 篇 PDF…`);
+        const body = new FormData();
+        for (const file of slice) body.append("files", file);
+        const payload = await readResponse<BatchImportResponse>(
+          await fetch(`${API}/papers/import/batch`, { method: "POST", body }),
+        );
+        for (const item of payload.results) {
+          if (item.status === "duplicate") duplicates += 1;
+          else if (item.status === "failed") {
+            failures.push(`${item.file_name}：${item.error || "导入失败"}`);
+          } else if (item.id != null) {
+            accepted.push({ id: item.id, title: item.title || item.file_name });
+          }
+        }
+      }
       await loadPapers();
-      await waitForPaper(payload.id, true);
+      const summary = [`已加入解析队列 ${accepted.length} 篇`];
+      if (duplicates) summary.push(`跳过重复 ${duplicates} 篇`);
+      if (failures.length) summary.push(`失败 ${failures.length} 篇`);
+      setNotice(summary.join("，")
+        + (failures.length ? `：${failures.slice(0, 3).join("；")}` : ""));
+      if (accepted.length === 1 && !duplicates && !failures.length) {
+        await waitForPaper(accepted[0].id, true);
+      }
     } catch (error) {
-      setNotice(`导入失败：${reasonOf(error)}`);
+      setNotice(`批量导入失败：${reasonOf(error)}`);
+      await loadPapers();
     } finally {
       setImporting(false);
-      event.target.value = "";
     }
   };
 
@@ -1077,8 +1117,8 @@ function App() {
             <h1>觅心 · 可追溯的医学论文精读</h1>
           </div>
         </div>
-        <label className="import-button">
-          <input type="file" accept=".pdf,application/pdf" onChange={importFile} disabled={importing} />
+        <label className="import-button" title="支持一次选择多篇 PDF">
+          <input type="file" accept=".pdf,application/pdf" multiple onChange={importFiles} disabled={importing} />
           {importing ? "处理中…" : "导入 PDF"}
         </label>
       </header>
@@ -1134,7 +1174,7 @@ function App() {
               papers={papers}
               selected={selected}
               onSelect={(id) => void selectPaper(id)}
-              onImport={importFile}
+              onImport={importFiles}
               importing={importing}
               libraryQuery={libraryQuery}
               setLibraryQuery={setLibraryQuery}
@@ -1627,11 +1667,11 @@ function Library({
         <div>
           <span className="eyebrow">LOCAL RESEARCH DESK</span>
           <h2>你的论文库</h2>
-          <p>导入医学论文，在本机完成解析、混合检索与可核验阅读。</p>
+          <p>一次可选择多篇 PDF，在本机完成解析、混合检索与可核验阅读。</p>
         </div>
-        <label className="primary">
-          <input type="file" accept=".pdf,application/pdf" onChange={onImport} disabled={importing} />
-          {importing ? "处理中…" : "＋ 导入论文"}
+        <label className="primary" title="支持一次选择多篇 PDF">
+          <input type="file" accept=".pdf,application/pdf" multiple onChange={onImport} disabled={importing} />
+          {importing ? "处理中…" : "＋ 批量导入"}
         </label>
       </div>
       <div className="privacy-card">
@@ -1714,7 +1754,7 @@ function Library({
         <div className="empty-state">
           <div className="empty-icon">＋</div>
           <h3>还没有论文</h3>
-          <p>导入一篇医学 PDF，开始建立你的本地证据库。</p>
+          <p>导入医学 PDF（支持多选），开始建立你的本地证据库。</p>
         </div>
       )}
     </section>

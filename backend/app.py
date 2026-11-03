@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -18,6 +19,7 @@ from pydantic import BaseModel, Field
 
 import fitz
 from fastapi import FastAPI, File, HTTPException, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -40,6 +42,8 @@ from .structured import extract_fields
 
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_PAGES = 300
+MAX_BATCH_FILES = 50
+UPLOAD_CHUNK = 1024 * 1024
 RECENT_TURNS = 10  # 最近 10 轮对话原文保留，更早的历史压缩为摘要
 LOGGER = logging.getLogger("heartseeker_med.ingestion")
 
@@ -1155,55 +1159,160 @@ def refresh_structured_paper(paper_id: int) -> dict[str, Any]:
         raise HTTPException(422, str(error)) from error
 
 
+def _safe_file_name(name: str) -> str:
+    """Keep the original stem readable while stripping path separators."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name)
+
+
+async def _save_upload(file: UploadFile, directory: Path) -> tuple[Path, str]:
+    """Stream one upload to a temp file, enforcing the size limit per file."""
+    directory.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        dir=directory, prefix=".upload-", suffix=".part", delete=False)
+    path = Path(handle.name)
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with handle:
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_FILE_SIZE:
+                    raise HTTPException(413, "单个 PDF 不得超过 50 MB")
+                digest.update(chunk)
+                handle.write(chunk)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    if size == 0:
+        path.unlink(missing_ok=True)
+        raise HTTPException(400, "PDF 文件为空")
+    return path, digest.hexdigest()
+
+
+def _read_pdf_info(path: Path, original_name: str) -> tuple[str, int]:
+    try:
+        with fitz.open(path) as document:
+            if len(document) > MAX_PAGES:
+                raise HTTPException(422, "单个 PDF 不得超过 300 页")
+            title = (document.metadata.get("title") or Path(original_name).stem).strip() \
+                or "未命名论文"
+            return title, len(document)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(422, f"解析 PDF 失败：{error}") from error
+
+
+def _paper_by_digest(db_path: Path | str, digest: str) -> Optional[dict[str, Any]]:
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT id, title FROM papers WHERE sha256 = ?", (digest,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def _register_paper(db_path: Path | str, title: str, file_name: str,
+                    stored_path: Path, digest: str, page_count: int) -> int:
+    with get_connection(db_path) as connection:
+        cursor = connection.execute(
+            "INSERT INTO papers(title, file_name, stored_path, sha256, page_count, status, imported_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (title, file_name, str(stored_path), digest, page_count, "processing", utc_now()),
+        )
+        paper_id = int(cursor.lastrowid)
+        connection.execute(
+            "INSERT INTO paper_metadata(paper_id, authors, abstract, keywords) VALUES(?,?,?,?)",
+            (paper_id, "[]", "", "[]"),
+        )
+        connection.commit()
+    return paper_id
+
+
+async def _import_one(file: UploadFile, db_path: Path | str, papers_dir: Path,
+                      enqueue: Any) -> dict[str, Any]:
+    """Persist one PDF and enqueue it for parsing; raise HTTPException on failure."""
+    original_name = (file.filename or "").strip()
+    if not original_name.lower().endswith(".pdf"):
+        raise HTTPException(400, "仅支持 PDF 文件")
+    temp_path, digest = await _save_upload(file, papers_dir)
+    final_path: Optional[Path] = None
+    registered = False
+    try:
+        existing = _paper_by_digest(db_path, digest)
+        if existing:
+            raise HTTPException(409, f"论文已导入：{existing['title']}")
+        title, page_count = await run_in_threadpool(_read_pdf_info, temp_path, original_name)
+        final_path = papers_dir / f"{digest[:16]}_{_safe_file_name(original_name)}"
+        temp_path.replace(final_path)
+        try:
+            paper_id = await run_in_threadpool(
+                _register_paper, db_path, title, original_name, final_path, digest, page_count)
+        except sqlite3.IntegrityError as error:
+            # A concurrent request inserted the same digest first.  The file is
+            # byte-identical and belongs to that winning row, so keep it.
+            registered = True
+            raise HTTPException(409, f"论文已导入：{title}") from error
+        registered = True
+        enqueue(paper_id, final_path)
+        return {"id": paper_id, "title": title, "status": "processing",
+                "page_count": page_count}
+    finally:
+        temp_path.unlink(missing_ok=True)
+        if final_path is not None and not registered:
+            final_path.unlink(missing_ok=True)
+
+
 @app.post("/api/papers/import")
 async def import_paper(file: UploadFile = File(...)) -> dict[str, Any]:
-    """Validate and persist the PDF, then parse/embed it on a background worker.
+    """Validate and persist one PDF, then parse/embed it on a background worker.
 
     The response returns as soon as the file is durable; the client polls
     ``/api/papers/{id}/status`` for progress.
     """
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "仅支持 PDF 文件")
-    content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(413, "单个 PDF 不得超过 50 MB")
-    digest = hashlib.sha256(content).hexdigest()
-    with get_connection() as connection:
-        existing = connection.execute("SELECT id, title FROM papers WHERE sha256 = ?", (digest,)).fetchone()
-        if existing:
-            raise HTTPException(409, f"论文已导入：{existing['title']}")
+    return await _import_one(file, DB_PATH, PAPERS_DIR, _enqueue_import)
 
-    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", file.filename)
-    stored_path = PAPERS_DIR / f"{digest[:16]}_{safe_name}"
-    stored_path.write_bytes(content)
-    try:
-        with fitz.open(stored_path) as document:
-            if len(document) > MAX_PAGES:
-                raise ValueError("单个 PDF 不得超过 300 页")
-            title = (document.metadata.get("title") or Path(file.filename).stem).strip() or "未命名论文"
-            page_count = len(document)
-    except Exception as error:
-        stored_path.unlink(missing_ok=True)
-        raise HTTPException(422, f"解析 PDF 失败：{error}") from error
 
-    try:
-        with get_connection() as connection:
-            cursor = connection.execute(
-                "INSERT INTO papers(title, file_name, stored_path, sha256, page_count, status, imported_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (title, file.filename, str(stored_path), digest, page_count, "processing", utc_now()),
-            )
-            paper_id = int(cursor.lastrowid)
-            connection.execute(
-                "INSERT INTO paper_metadata(paper_id, authors, abstract, keywords) VALUES(?,?,?,?)",
-                (paper_id, "[]", "", "[]"),
-            )
-            connection.commit()
-    except Exception:
-        stored_path.unlink(missing_ok=True)
-        raise
-    _enqueue_import(paper_id, stored_path)
-    return {"id": paper_id, "title": title, "status": "processing", "page_count": page_count}
+@app.post("/api/papers/import/batch")
+async def import_papers(files: list[UploadFile] = File(...)) -> dict[str, Any]:
+    """Import several PDFs in one request.
+
+    Every file is handled independently: one invalid, oversized or duplicate
+    file does not reject the rest.  Accepted files are queued on the same
+    serial import worker as single-file imports.
+    """
+    if not files:
+        raise HTTPException(400, "请选择至少一个 PDF 文件")
+    if len(files) > MAX_BATCH_FILES:
+        raise HTTPException(400, f"单次最多导入 {MAX_BATCH_FILES} 个 PDF，请分批上传")
+
+    results: list[dict[str, Any]] = []
+    imported = duplicates = failed = 0
+    for upload in files:
+        name = upload.filename or ""
+        try:
+            payload = await _import_one(upload, DB_PATH, PAPERS_DIR, _enqueue_import)
+        except HTTPException as error:
+            if error.status_code == 409:
+                duplicates += 1
+                results.append({"file_name": name, "status": "duplicate",
+                                "error": str(error.detail), "http_status": 409})
+            else:
+                failed += 1
+                results.append({"file_name": name, "status": "failed",
+                                "error": str(error.detail),
+                                "http_status": error.status_code})
+        except Exception as error:  # one bad file must not break the batch
+            LOGGER.exception("batch import failed for %s", name)
+            failed += 1
+            results.append({"file_name": name, "status": "failed", "error": str(error)})
+        else:
+            imported += 1
+            results.append({"file_name": name, **payload, "status": "queued"})
+    return {"results": results, "imported": imported,
+            "duplicates": duplicates, "failed": failed}
 
 
 @app.get("/api/papers/{paper_id}/status")

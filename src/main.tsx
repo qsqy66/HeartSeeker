@@ -557,6 +557,7 @@ function App() {
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [papersLoading, setPapersLoading] = useState(true);
   const [generalChat, setGeneralChat] = useState<ChatMessage[]>([]);
   const [generalQuestion, setGeneralQuestion] = useState("");
   const [generalMode, setGeneralMode] = useState<GeneralMode>("library");
@@ -572,6 +573,9 @@ function App() {
       setPapers(await readResponse<Paper[]>(await fetch(`${API}/papers`)));
     } catch (error) {
       setNotice(`无法连接本地服务：${reasonOf(error)}`);
+    } finally {
+      // The first paint uses skeleton cards; polling must not re-show them.
+      setPapersLoading(false);
     }
   };
   const loadSettings = async () => {
@@ -1125,24 +1129,24 @@ function App() {
       {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice("")}>×</button></div>}
       <div className="layout">
         <nav className="nav">
-          <button className={tab === "chat" ? "nav-active" : ""} onClick={() => setTab("chat")}>
+          <button aria-label="主对话 · 通用医学" className={tab === "chat" ? "nav-active" : ""} onClick={() => setTab("chat")}>
             ◈ <span>主对话 · 通用医学</span>
           </button>
-          <button className={tab === "library" ? "nav-active" : ""} onClick={() => setTab("library")}>
+          <button aria-label="论文库 · 全库检索" className={tab === "library" ? "nav-active" : ""} onClick={() => setTab("library")}>
             ◫ <span>论文库 · 全库检索</span>
           </button>
-          <button className={tab === "stats" ? "nav-active" : ""} onClick={() => setTab("stats")}>
+          <button aria-label="统计数据" className={tab === "stats" ? "nav-active" : ""} onClick={() => setTab("stats")}>
             ▤ <span>统计数据</span>
           </button>
-          <button className={tab === "logs" ? "nav-active" : ""} onClick={() => setTab("logs")}>
+          <button aria-label="运行日志" className={tab === "logs" ? "nav-active" : ""} onClick={() => setTab("logs")}>
             ≋ <span>运行日志</span>
           </button>
           {selected && (
-            <button className={tab === "reader" ? "nav-active" : ""} onClick={() => setTab("reader")}>
+            <button aria-label="论文工作台" className={tab === "reader" ? "nav-active" : ""} onClick={() => setTab("reader")}>
               ▣ <span>论文工作台</span>
             </button>
           )}
-          <button className={tab === "settings" ? "nav-active" : ""} onClick={() => setTab("settings")}>
+          <button aria-label="设置与隐私" className={tab === "settings" ? "nav-active" : ""} onClick={() => setTab("settings")}>
             ⚙ <span>设置与隐私</span>
           </button>
           <div className="nav-foot">本地优先<br /><small>数据不会自动上传</small></div>
@@ -1176,6 +1180,7 @@ function App() {
               onSelect={(id) => void selectPaper(id)}
               onImport={importFiles}
               importing={importing}
+              papersLoading={papersLoading}
               libraryQuery={libraryQuery}
               setLibraryQuery={setLibraryQuery}
               libraryResults={libraryResults}
@@ -1642,6 +1647,7 @@ function Library({
   onSelect,
   onImport,
   importing,
+  papersLoading,
   libraryQuery,
   setLibraryQuery,
   libraryResults,
@@ -1654,6 +1660,7 @@ function Library({
   onSelect: (id: number) => void;
   onImport: (event: ChangeEvent<HTMLInputElement>) => void;
   importing: boolean;
+  papersLoading: boolean;
   libraryQuery: string;
   setLibraryQuery: (value: string) => void;
   libraryResults: SearchResult[];
@@ -1718,12 +1725,33 @@ function Library({
         <h3>全部论文</h3>
         <span>{papers.length} 篇</span>
       </div>
-      {papers.length ? (
+      {papersLoading && !papers.length ? (
+        <div className="paper-grid" aria-busy="true" aria-label="正在加载论文库">
+          {Array.from({ length: 6 }).map((_, index) => (
+            <div className="paper-card skeleton-card" key={index}>
+              <span className="skeleton skeleton-icon" />
+              <div className="paper-info">
+                <span className="skeleton skeleton-line wide" />
+                <span className="skeleton skeleton-line" />
+                <span className="skeleton skeleton-line short" />
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : papers.length ? (
         <div className="paper-grid">
           {papers.map((paper) => {
             const total = paper.progress_total || 0;
             const current = paper.progress_current || 0;
             const ratio = total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 35;
+            const tone = paper.status === "ready"
+              ? (paper.needs_ocr ? "warn" : "ok")
+              : paper.status === "processing" ? "busy" : "error";
+            const statusLabel = paper.status === "ready"
+              ? (paper.needs_ocr ? "需 OCR" : paper.vectorized ? "混合索引" : "仅关键词")
+              : paper.status === "processing"
+                ? `${stageLabel(paper.progress_stage)}${total ? ` ${current}/${total}` : ""}`
+                : paper.status;
             return (
               <button
                 className={`paper-card ${selected?.paper.id === paper.id ? "selected" : ""}`}
@@ -1734,13 +1762,10 @@ function Library({
                 <div className="paper-info">
                   <h3>{paper.title}</h3>
                   <p>{paper.file_name}</p>
-                  <small>
-                    {paper.page_count} 页 · {paper.status === "ready"
-                      ? (paper.needs_ocr ? "需 OCR" : paper.vectorized ? "已完成 · 混合索引" : "已完成 · 仅关键词")
-                      : paper.status === "processing"
-                        ? `${stageLabel(paper.progress_stage)}${total ? ` ${current}/${total}` : ""}`
-                        : paper.status}
-                  </small>
+                  <div className="paper-meta">
+                    <span>{paper.page_count} 页</span>
+                    <span className={`status-pill ${tone}`}>{statusLabel}</span>
+                  </div>
                   {paper.status === "processing" && (
                     <div className="progress-track"><span style={{ width: `${ratio}%` }} /></div>
                   )}

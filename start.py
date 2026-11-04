@@ -88,6 +88,37 @@ def dist_available() -> bool:
     return (ROOT / "dist" / "index.html").is_file()
 
 
+def frontend_needs_build() -> bool:
+    """Return True when frontend sources are newer than the built entry file.
+
+    ``dist/`` is intentionally git-ignored, so a ``git pull`` updates ``src/``
+    but leaves the previous build in place.  Without this check start.py keeps
+    serving that stale build forever because it only asks whether dist exists.
+    """
+    index = ROOT / "dist" / "index.html"
+    if not index.is_file():
+        return False
+    newest = index.stat().st_mtime
+    candidates: list[Path] = []
+    for name in (
+        "index.html", "package.json", "package-lock.json", "pnpm-lock.yaml",
+        "tsconfig.json", "tsconfig.app.json", "tsconfig.node.json",
+    ):
+        candidates.append(ROOT / name)
+    candidates.extend(ROOT.glob("vite.config.*"))
+    for directory in ("src", "public"):
+        base = ROOT / directory
+        if base.is_dir():
+            candidates.extend(base.rglob("*"))
+    for path in candidates:
+        try:
+            if path.is_file():
+                newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            continue
+    return newest > index.stat().st_mtime
+
+
 def resolve_frontend_mode(dev: bool, prod: bool) -> str:
     """Return ``"dev"`` (Vite) or ``"built"`` (backend serves dist/)."""
     if dev and prod:
@@ -210,10 +241,14 @@ def main() -> int:
         except (ValueError, OSError):
             pass
 
-    mode = resolve_frontend_mode(args.dev, args.prod)
     if args.build:
         build_frontend()
         mode = "built"
+    else:
+        mode = resolve_frontend_mode(args.dev, args.prod)
+        if mode == "built" and frontend_needs_build():
+            log("setup", "检测到前端源码比 dist/ 新，自动重新构建 …")
+            build_frontend()
     app_url = BACKEND_URL if mode == "built" else FRONTEND_URL
 
     # 已在运行的服务直接复用，只启动缺失的部分

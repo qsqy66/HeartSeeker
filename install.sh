@@ -101,4 +101,8 @@ ensure_python
 ensure_node
 
 log "环境就绪，开始部署（自动打开浏览器）…"
-exec python3 start.py "$@"
+# 安装/更新后默认构建生产前端；--dev 时尊重用户的开发模式选择。
+if [[ " $* " == *" --dev "* ]]; then
+    exec python3 start.py "$@"
+fi
+exec python3 start.py --build "$@"
